@@ -1,0 +1,493 @@
+from flask import Flask, render_template_string
+import io
+import tempfile
+from pathlib import Path
+from PIL import Image
+from fpdf import FPDF
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+
+HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NotesAI — Luxury Workspace</title>
+<style>
+:root{--bg:#15161a;--panel:#202127;--panel2:#25262d;--gold:#d7b36a;--text:#f5f0e5;--muted:#a3a3ad;--line:#34343c}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(ellipse at 80% 0,#30291f 0,transparent 35%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,sans-serif}
+button,a{font:inherit}a{color:inherit;text-decoration:none}
+.app{min-height:100vh;display:grid;grid-template-columns:245px minmax(0,1fr)}
+.sidebar{padding:28px 18px;border-right:1px solid var(--line);background:#191a1f}
+.brand{display:flex;align-items:center;gap:12px;padding:4px 8px 32px}
+.logo{width:42px;height:42px;border-radius:14px;display:grid;place-items:center;color:#19150e;font-size:22px;background:linear-gradient(145deg,#f2d99b,#b58b43);box-shadow:4px 4px 12px #0d0e11,-3px -3px 9px #303039}
+.brand strong{font-size:18px;letter-spacing:.3px}.brand small{display:block;color:var(--gold);font-size:10px;letter-spacing:2px;margin-top:4px}
+.nav-label{font-size:10px;letter-spacing:2px;color:#777984;padding:14px 12px}
+.nav a{display:flex;align-items:center;gap:13px;padding:13px 14px;border-radius:13px;margin:5px 0;color:#b6b6bf;font-size:13px}
+.nav a.active{color:var(--gold);background:linear-gradient(145deg,#282a31,#1b1c22);box-shadow:inset 3px 3px 7px #121318,inset -3px -3px 7px #30313a}
+.nav a:hover{color:var(--gold)}.nav-icon{width:20px;text-align:center;font-size:16px}
+.side-bottom{margin-top:38px;padding:17px;border:1px solid #39332a;border-radius:17px;background:linear-gradient(145deg,#29261f,#1d1c1a)}
+.side-bottom p{font-size:12px;line-height:1.6;color:var(--muted)}
+.main{padding:28px clamp(18px,4vw,52px);min-width:0;max-width:1500px;width:100%;margin:auto}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:38px}
+.eyebrow{font-size:10px;color:var(--gold);letter-spacing:2.5px;text-transform:uppercase}
+.topbar h1{font-size:clamp(24px,3vw,34px);letter-spacing:-1px;margin:8px 0 0}
+.avatar{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;border:1px solid #66583a;color:var(--gold);background:linear-gradient(145deg,#30313a,#191a20);box-shadow:4px 4px 10px #101115,-3px -3px 8px #292a32}
+.welcome{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:27px}
+.welcome h2{font-size:clamp(22px,3vw,30px);margin:0 0 9px}.welcome p{margin:0;color:var(--muted);font-size:13px;line-height:1.7}
+.btn{border:1px solid #4b402d;background:linear-gradient(145deg,#ead18e,#bd954c);color:#211a0e;border-radius:12px;padding:13px 18px;font-weight:750;cursor:pointer;box-shadow:5px 5px 12px #101115,-3px -3px 9px #2b2c34;white-space:nowrap}
+.btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin-bottom:30px}
+.stat,.panel{background:linear-gradient(145deg,#262830,#1c1d23);border:1px solid #30313a;border-radius:19px;box-shadow:8px 8px 18px #101115,-5px -5px 14px #292a32}
+.stat{padding:22px}.stat-top{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:12px}
+.stat-icon{width:35px;height:35px;display:grid;place-items:center;border-radius:11px;color:var(--gold);background:linear-gradient(145deg,#2d2e36,#1b1c22);box-shadow:inset 2px 2px 5px #15161b,inset -2px -2px 5px #30313b}
+.stat h3{font-size:30px;margin:17px 0 5px}.stat p{font-size:11px;color:#9698a2;margin:0}
+.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:30px 0 17px}
+.section-head h2{font-size:18px;margin:0}.subtle{font-size:12px;color:var(--muted)}
+.workspace{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(240px,.85fr);gap:20px}
+.panel{padding:23px;min-width:0}.panel h3{font-size:16px;margin:0 0 8px}.panel p{font-size:12px;color:var(--muted);line-height:1.7}
+.dropzone{margin-top:18px;min-height:185px;border:1px dashed #74603c;border-radius:16px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;background:linear-gradient(145deg,#24252c,#1b1c22)}
+.upload-icon{font-size:28px;color:var(--gold);margin-bottom:13px}.dropzone strong{font-size:13px}.dropzone p{margin:8px 0 15px}
+.btn-outline{padding:10px 14px;border:1px solid #484039;color:var(--gold);background:#24252b;border-radius:10px;cursor:pointer}
+.activity{display:flex;align-items:center;gap:13px;padding:15px 0;border-bottom:1px solid #33343b}
+.activity:last-child{border-bottom:0}.activity-icon{width:39px;height:42px;flex-shrink:0;display:grid;place-items:center;border-radius:11px;color:var(--gold);background:#24252c;box-shadow:3px 3px 7px #14151a,-2px -2px 6px #30313a}
+.activity strong{display:block;font-size:12px}.activity small{display:block;color:var(--muted);font-size:10px;margin-top:5px}
+.tag{font-size:10px;color:var(--gold);background:#3a3020;border:1px solid #54452e;padding:5px 8px;border-radius:20px;margin-left:auto}
+.footer{padding:28px 0 10px;color:#777984;font-size:10px;text-align:center;letter-spacing:.5px}
+@media(max-width:950px){.app{grid-template-columns:78px minmax(0,1fr)}.sidebar{padding:20px 10px}.brand{justify-content:center;padding:4px 0 28px}.brand-copy,.nav-label,.nav-text,.side-bottom{display:none}.nav a{justify-content:center;padding:14px 5px}.nav-icon{font-size:18px}.workspace{grid-template-columns:1fr}}
+@media(max-width:600px){.app{display:block}.sidebar{border-right:0;border-bottom:1px solid var(--line);padding:10px 12px}.brand{display:none}.nav{display:flex;justify-content:space-between;gap:5px}.nav-label{display:none}.nav a{flex:1;margin:0;padding:11px 4px;font-size:10px;flex-direction:column;gap:5px}.nav-icon{font-size:17px}.nav-text{display:block}.main{padding:22px 15px}.topbar{margin-bottom:28px}.welcome{align-items:flex-start;flex-direction:column}.stats{grid-template-columns:1fr;gap:12px}.stat{padding:17px}.stat h3{font-size:25px}.panel{padding:18px}.section-head{margin-top:25px}}
+
+/* WHITE LUXURY THEME */
+:root{--bg:#f4f7fb;--panel:#ffffff;--panel2:#f8fbff;--gold:#c69b43;--text:#172b49;--muted:#718096;--line:#e5ebf3}
+body{background:#f4f7fb!important;color:#172b49!important}
+.sidebar{background:#142a4f!important;border-color:#233c60!important}
+.brand strong{color:#fff}.brand small{color:#9fcfff}
+.nav-label{color:#9aabc3}
+.nav a{color:#d5dfef}
+.nav a.active{color:#fff;background:linear-gradient(145deg,#24456f,#173354);box-shadow:inset 3px 3px 7px #10213b,inset -3px -3px 7px #2b4d76}
+.nav a:hover{color:#80c9ff}
+.logo{background:linear-gradient(145deg,#78ceff,#3699e6);color:#102744}
+.side-bottom{background:#1a365c;border-color:#365174}
+.side-bottom p{color:#d0dced}
+.main{color:#172b49}
+.eyebrow{color:#327fc0}
+.topbar h1,.welcome h2,.section-head h2,.panel h3,.stat h3{color:#172b49}
+.avatar{background:#fff;color:#2369a6;border-color:#d8e6f5;box-shadow:4px 4px 10px #dce3ed,-3px -3px 8px #fff}
+.stat,.panel{background:#fff!important;color:#172b49!important;border:1px solid #e5ebf3!important;border-radius:19px;box-shadow:7px 7px 18px #dce3ed,-5px -5px 14px #fff!important}
+.stat-top,.subtle{color:#718096}
+.stat p,.panel p,.activity small{color:#718096}
+.stat-icon,.activity-icon{background:#f1f7ff;color:#3188cc;box-shadow:inset 2px 2px 5px #dce5f0,inset -2px -2px 5px #fff}
+.btn{background:linear-gradient(145deg,#68c5ff,#3d9ee8);color:#102744;border:1px solid #55afea;box-shadow:5px 5px 12px #d7e1ec,-3px -3px 9px #fff}
+.btn:hover{filter:brightness(1.03)}
+.btn-outline{background:#f2f8ff;color:#1766a7;border-color:#cfe5f8}
+.dropzone{background:#f8fbff;border-color:#a8d3f3}
+.dropzone strong{color:#172b49}
+.activity{border-color:#edf1f6}
+.activity strong{color:#243c5c}
+.tag{color:#246da9;background:#edf7ff;border-color:#cce7fa}
+.footer{color:#8a96a8}
+@media(max-width:600px){.sidebar{background:#142a4f!important}.nav a.active{background:#24456f!important}}
+
+
+.upload-settings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:18px}
+.upload-settings label{display:block;font-size:11px;font-weight:700;color:var(--muted)}
+.upload-settings select{display:block;width:100%;margin-top:7px;padding:11px 8px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);font:inherit;font-size:12px}
+.file-preview{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:10px;width:100%;margin-top:14px}
+.file-preview>p{margin:0!important}
+.file-item{min-width:0;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+.file-item img,.pdf-preview-frame{display:block;width:100%;height:105px;object-fit:contain;border:0;border-radius:6px;background:#edf3f9}
+.file-item strong{display:block;overflow-wrap:anywhere;font-size:10px;margin-top:7px}
+.file-item small{display:block;color:var(--muted);font-size:10px;margin-top:4px}
+.upload-actions{margin-top:18px}
+.upload-actions p{overflow-wrap:anywhere}
+.upload-actions button:disabled{opacity:.6;cursor:wait}
+@media(max-width:600px){.upload-settings{grid-template-columns:1fr}.upload-actions .btn{width:100%;white-space:normal}}
+
+
+.extract-actions{margin-top:16px}
+#extractedText{display:block;width:100%;min-height:180px;margin-top:8px;padding:13px;border:1px solid var(--line);border-radius:12px;background:var(--panel2);color:var(--text);font:inherit;font-size:13px;line-height:1.7;resize:vertical}
+.extracted-label{display:block;margin-top:18px;font-size:12px;font-weight:700;color:var(--muted)}
+
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="sidebar">
+  <div class="brand"><div class="logo">N</div><div class="brand-copy"><strong>NotesAI</strong><small>INTELLIGENT WORKSPACE</small></div></div>
+  <div class="nav-label">WORKSPACE</div>
+  <nav class="nav">
+    <a class="active" href="/"><span class="nav-icon">⌂</span><span class="nav-text">Dashboard</span></a>
+    <a href="#upload"><span class="nav-icon">▤</span><span class="nav-text">My Notes</span></a>
+    <a href="#upload"><span class="nav-icon">⇧</span><span class="nav-text">New Order</span></a>
+    <a href="#activity"><span class="nav-icon">◷</span><span class="nav-text">History</span></a>
+  </nav>
+  <div class="nav-label">ACCOUNT</div>
+  <nav class="nav"><a href="#account"><span class="nav-icon">⚙</span><span class="nav-text">Settings</span></a></nav>
+  <div class="side-bottom"><span style="color:var(--gold)">✦ Premium Workspace</span><p>Your handwritten notes, beautifully transformed into digital documents.</p></div>
+</aside>
+<main class="main">
+  <header class="topbar"><div><div class="eyebrow">YOUR DIGITAL ATELIER</div><h1>Workspace Overview</h1></div><div class="avatar">N</div></header>
+  <section class="welcome"><div><h2>Ideas, refined. <span style="color:var(--gold)">Effortlessly.</span></h2><p>Welcome to your private workspace.<br>Turn handwritten thoughts into polished digital documents.</p></div><a class="btn" href="#upload">＋ Create New Order</a></section>
+  <section class="stats">
+    <article class="stat"><div class="stat-top"><span>Total Documents</span><span class="stat-icon">▤</span></div><h3>—</h3><p>Your documents at a glance</p></article>
+    <article class="stat"><div class="stat-top"><span>In Progress</span><span class="stat-icon">◷</span></div><h3>—</h3><p>Orders being processed</p></article>
+    <article class="stat"><div class="stat-top"><span>Completed</span><span class="stat-icon">✓</span></div><h3>—</h3><p>Ready for your review</p></article>
+  </section>
+  <div class="section-head"><h2>Document Studio</h2><span class="subtle">01 / CREATE</span></div>
+  <section class="workspace">
+    <article class="panel" id="upload">
+      <div class="eyebrow">AI CONVERSION</div>
+      <h3 style="margin-top:10px">Bring your notes to life</h3>
+      <p>Select handwritten-note images or an existing PDF. Preview your files, choose page settings, and generate a downloadable PDF.</p>
+      <form id="uploadForm" enctype="multipart/form-data">
+        <div class="dropzone">
+          <div class="upload-icon">✧</div>
+          <strong>Your document starts here</strong>
+          <p>JPG, PNG, WEBP, BMP or PDF · Maximum 20 MB</p>
+          <button class="btn-outline" type="button" onclick="document.getElementById('noteFile').click()">Choose Files</button>
+          <input id="noteFile" name="noteFiles" type="file" accept="image/*,.pdf" multiple hidden>
+          <div id="filePreview" class="file-preview"><p>No file selected</p></div>
+        </div>
+        <div class="upload-settings">
+          <label>Page size<select name="pageSize"><option value="A4">A4</option><option value="Letter">Letter</option></select></label>
+          <label>Orientation<select name="orientation"><option value="P">Portrait</option><option value="L">Landscape</option></select></label>
+          <label>Page margin<select name="margin"><option value="8">Compact</option><option value="12" selected>Standard</option><option value="16">Wide</option></select></label>
+        </div>
+        <div class="extract-actions"><button class="btn-outline" id="extractBtn" type="button">Extract Editable Text with Gemini</button></div>
+        <label class="extracted-label" for="extractedText">Extracted text — review and edit</label>
+        <textarea id="extractedText" name="extractedText" rows="8" placeholder="Gemini's extracted text will appear here..."></textarea>
+        <div class="upload-actions"><button class="btn" id="generateBtn" type="submit">Generate &amp; Download PDF</button><p id="uploadStatus" role="status" aria-live="polite">Review extracted text here. PDF output currently uses the selected images.</p></div>
+      </form>
+    </article>
+    <article class="panel" id="activity"><div class="eyebrow">YOUR WORKSPACE</div><h3 style="margin-top:10px">Recent Activity</h3><p>Your latest documents and orders will appear here.</p>
+      <div class="activity"><div class="activity-icon">▤</div><div><strong>Document Studio</strong><small>Convert notes into digital text</small></div><span class="tag">READY</span></div>
+      <div class="activity"><div class="activity-icon">✧</div><div><strong>AI Formatting</strong><small>Organized, readable documents</small></div><span class="tag">AI</span></div>
+      <div class="activity"><div class="activity-icon">✓</div><div><strong>Preview & Review</strong><small>Review before finalizing</small></div></div>
+    </article>
+  </section>
+  <div class="footer">NOTESAI · A MORE REFINED WAY TO WORK</div>
+</main>
+</div>
+<script>
+(() => {
+  const form = document.getElementById('uploadForm');
+  if (!form) return;
+  const input = document.getElementById('noteFile');
+  const preview = document.getElementById('filePreview');
+  const status = document.getElementById('uploadStatus');
+  const button = document.getElementById('generateBtn');
+
+  input.addEventListener('change', () => {
+    preview.replaceChildren();
+    const files = Array.from(input.files || []);
+    if (!files.length) {
+      preview.textContent = 'No file selected';
+      status.textContent = '';
+      return;
+    }
+    files.forEach(file => {
+      const card = document.createElement('div');
+      card.className = 'file-item';
+      if (file.type.startsWith('image/')) {
+        const img = document.createElement('img');
+        img.alt = 'Selected image preview';
+        img.src = URL.createObjectURL(file);
+        card.appendChild(img);
+      } else if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+        const frame = document.createElement('iframe');
+        frame.className = 'pdf-preview-frame';
+        frame.title = 'PDF preview';
+        frame.src = URL.createObjectURL(file);
+        card.appendChild(frame);
+      }
+      const name = document.createElement('strong');
+      name.textContent = file.name;
+      const size = document.createElement('small');
+      size.textContent = file.size < 1048576
+        ? (file.size / 1024).toFixed(1) + ' KB'
+        : (file.size / 1048576).toFixed(2) + ' MB';
+      card.append(name, size);
+      preview.appendChild(card);
+    });
+    status.textContent = files.length + ' file(s) selected.';
+  });
+
+  const extractBtn = document.getElementById('extractBtn');
+  const extractedText = document.getElementById('extractedText');
+
+  extractBtn.addEventListener('click', async () => {
+    if (!input.files.length) {
+      status.textContent = 'Please choose note images or a PDF first.';
+      return;
+    }
+    extractBtn.disabled = true;
+    status.textContent = 'Gemini is reading your notes…';
+    try {
+      const response = await fetch('/extract-text', {
+        method: 'POST',
+        body: new FormData(form)
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        status.textContent = data.error || 'Text extraction failed.';
+        return;
+      }
+      extractedText.value = data.text || '';
+      status.textContent = 'Text extracted. Review and correct it before continuing.';
+      extractedText.focus();
+    } catch (_) {
+      status.textContent = 'Connection error. Check that NotesAI is running.';
+    } finally {
+      extractBtn.disabled = false;
+    }
+  });
+
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!input.files.length) {
+      status.textContent = 'Please choose an image or PDF first.';
+      return;
+    }
+    button.disabled = true;
+    status.textContent = 'Preparing your PDF…';
+    try {
+      const response = await fetch('/generate-pdf', {
+        method: 'POST',
+        body: new FormData(form)
+      });
+      if (!response.ok) {
+        let message = 'Could not process the file. Check the file type and 20 MB limit.';
+        try {
+          const data = await response.json();
+          message = data.error || message;
+        } catch (_) {}
+        status.textContent = message;
+        return;
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'NotesAI-Document.pdf';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      status.textContent = response.headers.get('X-NotesAI-Status') === 'already-pdf'
+        ? 'Your existing PDF has been downloaded.'
+        : 'PDF generated and downloaded successfully.';
+    } catch (_) {
+      status.textContent = 'Connection error. Please check that NotesAI is running.';
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+
+@app.route("/extract-text", methods=["POST"])
+def extract_text():
+    from flask import request, jsonify
+    from google import genai
+    from google.genai import types
+    import os
+
+    files = [f for f in request.files.getlist("noteFiles") if f and f.filename]
+    if not files:
+        return jsonify(error="Choose at least one image or PDF first."), 400
+
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not key:
+        env_path = Path(".env")
+        if env_path.is_file():
+            for line in env_path.read_text(errors="ignore").splitlines():
+                if line.startswith("GEMINI_API_KEY=") or line.startswith("GOOGLE_API_KEY="):
+                    key = line.split("=", 1)[1].strip().strip("'\"")
+                    if key:
+                        break
+    if not key:
+        return jsonify(error="Gemini API key is missing. Check the .env configuration."), 503
+
+    mime_types = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png", "webp": "image/webp",
+        "bmp": "image/bmp", "pdf": "application/pdf"
+    }
+    parts = []
+    for uploaded in files:
+        ext = uploaded.filename.rsplit(".", 1)[-1].lower() if "." in uploaded.filename else ""
+        if ext not in mime_types:
+            return jsonify(error="Supported files: JPG, PNG, WEBP, BMP and PDF."), 400
+        data = uploaded.read()
+        if not data:
+            return jsonify(error="One of the selected files is empty."), 400
+        if ext == "pdf" and not data.startswith(b"%PDF-"):
+            return jsonify(error="The selected PDF file is invalid."), 400
+        parts.append(types.Part.from_bytes(data=data, mime_type=mime_types[ext]))
+
+    prompt = (
+        "Transcribe the visible text in the attached notes as accurately as possible. "
+        "Preserve the original language and script, including Urdu, Arabic, and English. "
+        "Keep headings, paragraphs, numbering, lists, equations, and table structure where possible. "
+        "Do not translate, summarize, or invent missing words. Mark genuinely unreadable text as [unclear]. "
+        "Return only the editable transcription, without an introduction."
+    )
+    try:
+        client = genai.Client(api_key=key)
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            contents=[prompt, *parts],
+            config=types.GenerateContentConfig(temperature=0)
+        )
+        text = (response.text or "").strip()
+        if not text:
+            return jsonify(error="Gemini returned no text. Try a clearer image."), 502
+        return jsonify(text=text)
+    except Exception as exc:
+        app.logger.warning("Gemini extraction failed: %s", type(exc).__name__)
+        return jsonify(error="Gemini extraction failed. Check API access, quota, network, and model configuration."), 502
+
+@app.route("/generate-pdf", methods=["POST"])
+def generate_pdf():
+    from flask import request, jsonify, send_file
+
+    text = request.form.get("extractedText", "").strip()
+    if text:
+        try:
+            pdf = FPDF(unit="mm", format="A4")
+            pdf.set_auto_page_break(auto=True, margin=15)
+            pdf.add_font("DejaVu", fname="/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans.ttf")
+            pdf.add_page()
+            pdf.set_font("DejaVu", size=11)
+            pdf.multi_cell(w=0, h=6, text=text)
+            response = send_file(
+                io.BytesIO(bytes(pdf.output())),
+                mimetype="application/pdf",
+                as_attachment=True,
+                download_name="NotesAI-Text.pdf"
+            )
+            response.headers["X-NotesAI-Status"] = "text-pdf"
+            return response
+        except Exception:
+            app.logger.exception("Text PDF generation failed")
+            return jsonify(error="Text PDF generation failed. Please try again."), 500
+
+    files = [f for f in request.files.getlist("noteFiles") if f and f.filename]
+    if not files:
+        return jsonify(error="Choose at least one image or PDF."), 400
+
+    allowed_images = {"jpg", "jpeg", "png", "webp", "bmp"}
+    extensions = [
+        f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
+        for f in files
+    ]
+
+    if "pdf" in extensions:
+        if len(files) != 1 or extensions[0] != "pdf":
+            return jsonify(error="Upload one PDF at a time, without mixing it with images."), 400
+        data = files[0].read()
+        if not data.startswith(b"%PDF-"):
+            return jsonify(error="This file is not a valid PDF."), 400
+        response = send_file(
+            io.BytesIO(data), mimetype="application/pdf",
+            as_attachment=True, download_name="NotesAI-Document.pdf"
+        )
+        response.headers["X-NotesAI-Status"] = "already-pdf"
+        return response
+
+    if any(ext not in allowed_images for ext in extensions):
+        return jsonify(error="Supported formats: JPG, PNG, WEBP, BMP or PDF."), 400
+
+    orientation = request.form.get("orientation", "P")
+    page_size = request.form.get("pageSize", "A4")
+    try:
+        margin = int(request.form.get("margin", "12"))
+    except (TypeError, ValueError):
+        return jsonify(error="Choose a valid page margin."), 400
+    if orientation not in {"P", "L"} or page_size not in {"A4", "Letter"} or margin not in {8, 12, 16}:
+        return jsonify(error="Invalid PDF page settings."), 400
+
+    pdf = FPDF(orientation=orientation, unit="mm", format=page_size)
+    pdf.set_auto_page_break(auto=False)
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for index, uploaded in enumerate(files):
+                try:
+                    uploaded.stream.seek(0)
+                    with Image.open(uploaded.stream) as source:
+                        source.load()
+                        image = source.convert("RGB")
+                    image_path = Path(temp_dir) / f"page_{index}.jpg"
+                    image.save(image_path, format="JPEG", quality=92)
+                    pdf.add_page()
+                    max_width = pdf.w - 2 * margin
+                    max_height = pdf.h - 2 * margin
+                    scale = min(max_width / image.width, max_height / image.height)
+                    width = image.width * scale
+                    height = image.height * scale
+                    pdf.image(str(image_path), x=(pdf.w-width)/2,
+                              y=(pdf.h-height)/2, w=width, h=height)
+                except Exception:
+                    return jsonify(error=f"Could not read image: {uploaded.filename}"), 400
+
+            output = pdf.output(dest="S")
+            if isinstance(output, str):
+                output = output.encode("latin-1")
+            pdf_bytes = bytes(output)
+    except Exception:
+        return jsonify(error="PDF generation failed. Please try another image."), 500
+
+    return send_file(
+        io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=True,
+        download_name="NotesAI-Document.pdf"
+    )
+
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
+@app.route("/health")
+def health():
+    return {"status": "ok", "app": "NotesAI Luxury UI"}
+
+
+
+# NOTESAI LUXURY NAVIGATION ROUTES
+PAGES = {
+    "My Notes": ("My Notes", "Your digital document library will appear here."),
+    "New Order": ("Create a New Order", "Upload handwritten notes to begin a document order."),
+    "History": ("Order History", "Your previous and completed orders will appear here."),
+    "Settings": ("Workspace Settings", "Manage your NotesAI workspace preferences."),
+}
+
+@app.route("/<page>")
+def navigation_page(page):
+    from flask import abort
+    from markupsafe import escape
+
+    if page not in ("my-notes", "new-order", "history", "settings"):
+        abort(404)
+
+    key = page.replace("-", " ").title()
+    title, description = PAGES[key]
+
+    return render_template_string(HTML.replace(
+        '<div class="eyebrow">YOUR DIGITAL ATELIER</div><h1>Workspace Overview</h1>',
+        '<div class="eyebrow">NOTESAI WORKSPACE</div><h1>' + str(escape(title)) + '</h1>'
+    ).replace(
+        '<h2>Ideas, refined. <span style="color:var(--gold)">Effortlessly.</span></h2><p>Welcome to your private workspace.<br>Turn handwritten thoughts into polished digital documents.</p>',
+        '<h2>' + str(escape(title)) + '</h2><p>' + str(escape(description)) + '</p>'
+    ),)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=3000, debug=True, use_reloader=True)
