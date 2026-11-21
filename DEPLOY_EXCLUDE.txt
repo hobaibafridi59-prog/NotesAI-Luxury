@@ -1,0 +1,61 @@
+# Files and directories to EXCLUDE from deployment
+# These are development-only or contain sensitive data
+
+# Sensitive files
+.env
+*.log
+*.tmp
+*.pid
+
+# Backup files
+app.py.bak*
+database.py.bak*
+models.py.bak*
+*.bak
+
+# Backup directories
+backup/
+__pycache__/
+*.pyc
+
+# Test files
+test_*.py
+test-*.py
+test_*.pdf
+test_*.png
+test_*.jpg
+
+# Development files
+notesai-server.log
+notesai-server.pid
+live.log
+server.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation (optional - include if needed)
+# docs/
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Node modules (if any)
+node_modules/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Large test assets
+test-assets/
+test_diagram_universal_ui.py
+test_skull_recreation.py
