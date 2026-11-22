@@ -34,9 +34,68 @@ import models
 # CONFIGURATION
 # ============================================================================
 
-# JWT secret key — should be set in .env as NOTESAI_JWT_SECRET
-# Falls back to a random key (not persistent across restarts) if not set
-JWT_SECRET = os.environ.get("NOTESAI_JWT_SECRET", secrets.token_hex(32))
+# JWT secret key — auto-generate and persist if not set in .env
+def _get_or_create_jwt_secret():
+    """Get JWT secret from .env or environment. Auto-generate and persist if missing."""
+    # Check .env file first
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    env_secret = None
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("NOTESAI_JWT_SECRET="):
+                        env_secret = line.split("=", 1)[1].strip().strip(chr(39) + chr(34))
+                        break
+        except Exception:
+            pass
+
+    # Check environment variable
+    if not env_secret:
+        env_secret = os.environ.get("NOTESAI_JWT_SECRET", "").strip()
+
+    # If found, use it
+    if env_secret:
+        return env_secret
+
+    # Auto-generate and persist
+    new_secret = secrets.token_hex(32)
+    try:
+        # Read existing .env content
+        existing_lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                existing_lines = f.readlines()
+
+        # Add the new secret
+        # Check if NOTESAI_JWT_SECRET already exists (even if empty)
+        found = False
+        for i, line in enumerate(existing_lines):
+            if line.strip().startswith("NOTESAI_JWT_SECRET="):
+                existing_lines[i] = f"NOTESAI_JWT_SECRET={new_secret}\n"
+                found = True
+                break
+
+        if not found:
+            existing_lines.append(f"\n# Auto-generated JWT secret (do not share)\n")
+            existing_lines.append(f"NOTESAI_JWT_SECRET={new_secret}\n")
+
+        with open(env_path, "w") as f:
+            f.writelines(existing_lines)
+        try:
+            os.chmod(env_path, 0o600)
+        except Exception:
+            pass
+
+        # Also set in environment for current process
+        os.environ["NOTESAI_JWT_SECRET"] = new_secret
+        return new_secret
+    except Exception:
+        # Fallback to random (not persistent)
+        return secrets.token_hex(32)
+
+JWT_SECRET = _get_or_create_jwt_secret()
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRY_MINUTES = 15
 REFRESH_TOKEN_EXPIRY_DAYS = 7
