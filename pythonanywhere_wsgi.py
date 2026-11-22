@@ -1,7 +1,7 @@
 """
 PythonAnywhere WSGI Configuration File.
 
-Copy this file to /var/www/yourusername_pythonanywhere_com_wsgi.py
+Copy this file to /var/www/hobaibafridi59_pythonanywhere_com_wsgi.py
 on PythonAnywhere and update the paths.
 
 DO NOT commit this file with real secrets.
@@ -10,7 +10,7 @@ import sys
 import os
 
 # Project directory (update with your actual username)
-PROJECT_HOME = '/home/yourusername/notesai-github'
+PROJECT_HOME = '/home/hobaibafridi59/notesai-deploy'
 
 if PROJECT_HOME not in sys.path:
     sys.path.insert(0, PROJECT_HOME)
