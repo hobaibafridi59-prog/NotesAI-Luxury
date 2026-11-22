@@ -4293,6 +4293,20 @@ HTML = r"""
   } catch (error) {}
 })();
 </script>
+<script>
+  window.__ADMIN_TOKEN__ = {{ admin_token|tojson }};
+  (function() {
+    if (!window.__ADMIN_TOKEN__) return;
+    const _origFetch = window.fetch.bind(window);
+    window.fetch = function(input, init) {
+      init = init || {};
+      const headers = new Headers(init.headers || {});
+      if (!headers.has('X-Admin-Token')) headers.set('X-Admin-Token', window.__ADMIN_TOKEN__);
+      init.headers = headers;
+      return _origFetch(input, init);
+    };
+  })();
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -12337,7 +12351,7 @@ def pwa_offline():
 def home():
     stats = load_stats()
     activity = load_activity()[:5]
-    return render_template_string(HTML, page='dashboard', page_title='Dashboard', page_desc='', stats=stats, activity=activity)
+    return render_template_string(HTML, page='dashboard', page_title='Dashboard', page_desc='', stats=stats, activity=activity, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'))
 
 @app.route("/health")
 def health():
@@ -12358,7 +12372,7 @@ def navigation_page(page):
     if page not in PAGES:
         abort(404)
     title, description = PAGES[page]
-    return render_template_string(HTML, page=page, page_title=title, page_desc=description)
+    return render_template_string(HTML, page=page, page_title=title, page_desc=description, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'))
 
 if __name__ == "__main__":
     try:
