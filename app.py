@@ -29,7 +29,7 @@ from auth import (register_user, login_user, refresh_access_token, logout_user,
     hash_password, verify_password, validate_password, validate_email,
     get_current_user, get_current_user_id, is_admin, require_user_or_admin)
 from fpdf.enums import XPos, YPos
-from datetime import datetime
+from datetime import datetime, timedelta
 from markupsafe import escape
 import requests
 
@@ -84,6 +84,38 @@ def _no_cache_provider_ui(response):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
+    return response
+
+import gzip as _gzip
+
+@app.after_request
+def _gzip_compress(response):
+    """Gzip text responses for faster transfer (performance)."""
+    try:
+        if response.direct_passthrough:
+            return response
+        if response.status_code < 200 or response.status_code >= 300:
+            return response
+        if "Content-Encoding" in response.headers:
+            return response
+        ctype = (response.headers.get("Content-Type") or "").lower()
+        if not any(t in ctype for t in ("text/", "application/json", "application/javascript", "application/xml")):
+            return response
+        ae = (request.headers.get("Accept-Encoding") or "").lower()
+        if "gzip" not in ae:
+            return response
+        data = response.get_data()
+        if len(data) < 512:
+            return response
+        gz = _gzip.compress(data, compresslevel=6)
+        if len(gz) >= len(data):
+            return response
+        response.set_data(gz)
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["Content-Length"] = str(len(gz))
+        response.headers["Vary"] = "Accept-Encoding"
+    except Exception:
+        pass
     return response
 
 
@@ -558,6 +590,9 @@ def _document_defaults(document):
     favorite = record.get("favorite")
     record["favorite"] = favorite is True or str(favorite).lower() in {"1", "true", "yes", "on"}
     record.setdefault("deleted_at", None)
+    record.setdefault("retention_days", None)
+    record.setdefault("expires_at", None)
+    record.setdefault("service_option", "standard")
     if not record.get("updated_at"):
         record["updated_at"] = record.get("created")
     if not isinstance(record.get("tags"), list):
@@ -572,15 +607,17 @@ def _public_document(document):
     keys = ("id", "name", "type", "kind", "size", "created", "updated_at", "status",
             "provider", "model", "style", "diagram_style", "page_size",
             "orientation", "margin", "pages", "folder", "category", "tags",
-            "favorite", "deleted_at")
+            "favorite", "deleted_at", "retention_days", "expires_at", "service_option")
     return {key: record.get(key) for key in keys if key in record}
 
 
-def save_generated_document(pdf_bytes, name, kind, options=None, text="", provider="", model="", pages=None):
+def save_generated_document(pdf_bytes, name, kind, options=None, text="", provider="", model="", pages=None, retention_days=None):
     """Persist a generated PDF plus non-secret metadata for history/download."""
     if not pdf_bytes:
         return None
     options = options or {}
+    if retention_days is None:
+        retention_days = options.get("retentionDays") or options.get("retention_days")
     document_id = uuid.uuid4().hex
     filename = f"{document_id}.pdf"
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -595,6 +632,16 @@ def save_generated_document(pdf_bytes, name, kind, options=None, text="", provid
     except Exception:
         pass
     created = datetime.now().isoformat(timespec="seconds")
+    # Temporary PDF retention: 3 / 7 / 30 days (None = keep forever)
+    try:
+        rd = int(retention_days) if retention_days is not None else None
+    except (TypeError, ValueError):
+        rd = None
+    if rd not in (3, 7, 30):
+        rd = None
+    expires_at = None
+    if rd:
+        expires_at = (datetime.now() + timedelta(days=rd)).isoformat(timespec="seconds")
     # Add user_id if authenticated (Phase 3 multi-user support)
     user_id = None
     try:
@@ -626,6 +673,9 @@ def save_generated_document(pdf_bytes, name, kind, options=None, text="", provid
         "favorite": bool(options.get("favorite")),
         "user_id": user_id,
         "deleted_at": None,
+        "retention_days": rd,
+        "expires_at": expires_at,
+        "service_option": str(options.get("serviceOption") or "standard"),
         "pdf_options": {
             key: options.get(key) for key in (
                 "title", "subtitle", "headerText", "footerText", "accentColor",
@@ -683,6 +733,35 @@ def document_file_path(document):
         return None
     path = DOCUMENTS_DIR / filename
     return path if path.is_file() else None
+
+def cleanup_expired_documents():
+    """Delete PDFs whose retention period (3/7/30 days) has elapsed."""
+    now = datetime.now()
+    removed = 0
+    with _DOCUMENTS_LOCK:
+        documents = _load_documents()
+        kept = []
+        for doc in documents:
+            rec = _document_defaults(doc)
+            expires = rec.get("expires_at")
+            if expires:
+                try:
+                    if datetime.fromisoformat(expires) <= now:
+                        # delete file
+                        fn = rec.get("filename")
+                        if fn and re.fullmatch(r"[a-f0-9]{32}\.pdf", str(fn)):
+                            try:
+                                (DOCUMENTS_DIR / fn).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                        removed += 1
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            kept.append(doc)
+        if removed:
+            _save_documents(kept)
+    return removed
 
 
 def increment_stat(key, delta=1):
@@ -4480,6 +4559,17 @@ a { color: inherit; text-decoration: none; }
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 input, select, textarea { font: inherit; color: inherit; }
 img { max-width: 100%; height: auto; display: block; }
+/* Performance & smoothness */
+html { scroll-behavior: smooth; }
+*, *::before, *::after { -webkit-tap-highlight-color: transparent; }
+.panel, .card, .stat-card, .dashboard-card, .modal, .toast {
+  will-change: transform, opacity;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
 
 /* Keyboard skip link */
 .skip-link {
@@ -4959,6 +5049,7 @@ img { max-width: 100%; height: auto; display: block; }
   grid-template-columns: repeat(3, 1fr);
   gap: 16px;
   margin-bottom: 24px;
+  perspective: 1200px;
 }
 @media (max-width: 700px) { .stats { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 420px) { .stats { grid-template-columns: 1fr; } }
@@ -4981,7 +5072,8 @@ img { max-width: 100%; height: auto; display: block; }
   background: var(--grad-primary);
   opacity: 0; transition: opacity var(--transition-base);
 }
-.stat-card:hover { box-shadow: var(--elev-3), var(--depth-line); transform: translateY(-2px); }
+.stat-card { perspective: 1000px; transform-style: preserve-3d; }
+.stat-card:hover { box-shadow: var(--elev-3), var(--depth-line); transform: translateY(-4px) rotateX(2deg) translateZ(8px); }
 .stat-card:hover::before { opacity: 1; }
 .stat-card::after {
   content: '';
@@ -5997,8 +6089,9 @@ img { max-width: 100%; height: auto; display: block; }
 /* ============================================================
    STUDY WORKSPACE, ADMIN, DOCUMENT MANAGEMENT
    ============================================================ */
-.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); gap: 18px; margin-bottom: 20px; }
-.dashboard-card { padding: 20px; }
+.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); gap: 18px; margin-bottom: 20px; perspective: 1400px; }
+.dashboard-card { padding: 20px; perspective: 1200px; transform-style: preserve-3d; transition: transform var(--transition-base), box-shadow var(--transition-base); }
+.dashboard-card:hover { transform: translateY(-3px) rotateX(1.5deg) translateZ(6px); box-shadow: var(--elev-3); }
 .dashboard-card h3 { font-size: 15px; margin-bottom: 4px; }
 .dashboard-card p { font-size: 12px; color: var(--text-muted); margin-bottom: 14px; }
 .quick-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
@@ -6665,6 +6758,25 @@ img { max-width: 100%; height: auto; display: block; }
                 <span class="studio-field-label">Tags</span>
                 <span class="studio-field-hint">Comma-separated keywords. Example: biology, revision.</span>
                 <input class="form-input" name="tags" maxlength="200" placeholder="biology, revision">
+              </label>
+              <label class="studio-field">
+                <span class="studio-field-label">PDF retention (temporary)</span>
+                <span class="studio-field-hint">Auto-delete the generated PDF after this period.</span>
+                <select class="form-input" name="retentionDays">
+                  <option value="">Keep forever</option>
+                  <option value="3">3 days</option>
+                  <option value="7">7 days</option>
+                  <option value="30">30 days</option>
+                </select>
+              </label>
+              <label class="studio-field">
+                <span class="studio-field-label">Service option</span>
+                <span class="studio-field-hint">Processing priority for this PDF.</span>
+                <select class="form-input" name="serviceOption">
+                  <option value="standard">Standard</option>
+                  <option value="priority">Priority</option>
+                  <option value="express">Express</option>
+                </select>
               </label>
             </div>
           </div>
@@ -11209,6 +11321,14 @@ def api_diagram_reconstruct():
     return response
 
 
+@app.route("/api/documents/cleanup", methods=["POST"])
+@require_user_or_admin
+@security.rate_limit("api_general")
+def api_documents_cleanup():
+    removed = cleanup_expired_documents()
+    return jsonify({"removed": removed})
+
+
 @app.route("/api/documents")
 @require_user_or_admin
 @security.rate_limit("api_general")
@@ -11680,6 +11800,14 @@ def generate_pdf():
     raw_tags = request.form.get("tags") or ""
     options["tags"] = [tag.strip()[:32] for tag in raw_tags.split(",") if tag.strip()][:12]
     options["favorite"] = str(request.form.get("favorite") or "").lower() in {"1", "true", "yes", "on"}
+    options["serviceOption"] = (request.form.get("serviceOption") or "standard").strip().lower()
+    if options["serviceOption"] not in {"standard", "priority", "express"}:
+        options["serviceOption"] = "standard"
+    _rd = (request.form.get("retentionDays") or request.form.get("retention_days") or "").strip().lower()
+    if _rd in {"3", "7", "30"}:
+        options["retentionDays"] = int(_rd)
+    elif _rd in {"keep", "forever", "0", ""}:
+        options["retentionDays"] = None
 
     def pdf_response(pdf_bytes, download_name, status, provider="", model="", document_id=None):
         if preview_images:
@@ -12233,6 +12361,10 @@ def navigation_page(page):
     return render_template_string(HTML, page=page, page_title=title, page_desc=description)
 
 if __name__ == "__main__":
+    try:
+        cleanup_expired_documents()
+    except Exception:
+        pass
     # Production-safe defaults: loopback only, debugger disabled.
     # Development:  NOTESAI_DEBUG=1 python app.py
     # LAN access:   NOTESAI_HOST=0.0.0.0 NOTESAI_ADMIN_TOKEN=<secret> python app.py
