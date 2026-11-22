@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: notesai-premium
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: NOTESAI_ADMIN_TOKEN
+        generateValue: true
+      - key: NOTESAI_HOST
+        value: 0.0.0.0
