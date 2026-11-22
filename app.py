@@ -8209,6 +8209,10 @@ html { scroll-behavior: smooth; }
           try { xhr.abort(); } catch (_) {}
         }, { once: true });
       }
+      // Auto-inject admin token for remote deployments (e.g. PythonAnywhere)
+      if (window.__ADMIN_TOKEN__ && !(options.headers && options.headers['X-Admin-Token'])) {
+        try { xhr.setRequestHeader('X-Admin-Token', window.__ADMIN_TOKEN__); } catch (_) {}
+      }
       Object.entries(options.headers || {}).forEach(([key, value]) => {
         try { xhr.setRequestHeader(key, value); } catch (_) {}
       });
