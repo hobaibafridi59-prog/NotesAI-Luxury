@@ -393,12 +393,48 @@ def _decode_data_url(data_url: str) -> Image.Image:
 
 
 def _style_values(style: str) -> dict[str, str]:
-    if str(style or "").lower() == "pencil":
+    name = str(style or "").lower()
+    if name == "pencil":
         return {
             "background": "#fbf8ef",
             "ink": "#3f3f46",
             "stroke": "#52525b",
             "stroke_width": "0.45",
+        }
+    if name in {"schematic", "outline"}:
+        return {
+            "background": "#ffffff",
+            "ink": "#ffffff",
+            "stroke": "#0f172a",
+            "stroke_width": "0.45",
+        }
+    if name == "medical":
+        return {
+            "background": "#f0fdfa",
+            "ink": "#0f766e",
+            "stroke": "#134e4a",
+            "stroke_width": "0.32",
+        }
+    if name == "molecule2d":
+        return {
+            "background": "#f5f3ff",
+            "ink": "#5b21b6",
+            "stroke": "#4c1d95",
+            "stroke_width": "0.32",
+        }
+    if name == "structure3d":
+        return {
+            "background": "#eff6ff",
+            "ink": "#1e3a8a",
+            "stroke": "#172554",
+            "stroke_width": "0.32",
+        }
+    if name == "topographic":
+        return {
+            "background": "#fefce8",
+            "ink": "#92400e",
+            "stroke": "#78350f",
+            "stroke_width": "0.32",
         }
     return {
         "background": "#ffffff",

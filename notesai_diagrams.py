@@ -30,7 +30,11 @@ class DiagramRenderError(RuntimeError):
 
 _RENDERERS: dict[str, Callable[[dict], str]] = {}
 _ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
-_DIAGRAM_STYLES = {"color", "pencil"}
+_DIAGRAM_STYLES = {
+    "color", "pencil", "3d", "simple",
+    "medical", "vector", "schematic", "molecule2d", "structure3d",
+    "outline", "topographic",
+}
 
 
 def normalise_diagram_style(value: Any) -> str:
@@ -509,7 +513,58 @@ def render_generic_scene(diagram: dict) -> str:
         if label:
             body.append(_text((x1 + x2) / 2, (y1 + y2) / 2 - 6, label, 12, _MUTED))
 
-    return _svg(canvas_w, canvas_h, "".join(body))
+    # A sparse scene used to keep its full 1000x1000 canvas, which left a large
+    # blank area in the PDF. Trim to the drawn content (with a small margin) so
+    # the figure fills the available width instead of floating in whitespace.
+    element_xs: list[float] = []
+    element_ys: list[float] = []
+    for element in elements:
+        x, y, w, h = _bbox(element.get("bbox"))
+        if w or h:
+            element_xs.extend((x, x + w))
+            element_ys.extend((y, y + h))
+        points = [float(value) for value in element.get("points") or [] if isinstance(value, (int, float))]
+        for index in range(0, len(points) - 1, 2):
+            element_xs.append(points[index])
+            element_ys.append(points[index + 1])
+        if str(element.get("kind") or "").lower() == "text" or str(element.get("shape") or "").lower() == "text":
+            try:
+                text_x = float(element.get("x", 0))
+                text_y = float(element.get("y", 0))
+            except (TypeError, ValueError):
+                text_x = text_y = 0.0
+            if text_x or text_y:
+                element_xs.append(text_x)
+                element_ys.extend((text_y - 14, text_y + 6))
+
+    if not element_xs or not element_ys:
+        return _svg(canvas_w, canvas_h, "".join(body))
+
+    min_x, max_x = min(element_xs), max(element_xs)
+    min_y, max_y = min(element_ys), max(element_ys)
+    content_w = max(1.0, max_x - min_x)
+    content_h = max(1.0, max_y - min_y)
+    if content_w >= canvas_w * 0.75 and content_h >= canvas_h * 0.75:
+        return _svg(canvas_w, canvas_h, "".join(body))
+
+    title = clean_text(diagram.get("title") or "", 500)
+    if title:
+        min_x = min(min_x, canvas_w / 2 - 140)
+        max_x = max(max_x, canvas_w / 2 + 140)
+        min_y = min(min_y, 8.0)
+        max_y = max(max_y, 46.0)
+
+    pad = 18.0
+    view_w = max(220.0, max_x - min_x + pad * 2)
+    view_h = max(150.0, max_y - min_y + pad * 2)
+    offset_x = pad - min_x
+    offset_y = pad - min_y
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{view_w:.2f}" height="{view_h:.2f}" '
+        f'viewBox="0 0 {view_w:.2f} {view_h:.2f}">'
+        f'<rect x="0" y="0" width="{view_w:.2f}" height="{view_h:.2f}" fill="#ffffff"/>'
+        f'<g transform="translate({offset_x:.2f} {offset_y:.2f})">{"".join(body)}</g></svg>'
+    )
 
 
 @register("flowchart")
@@ -763,6 +818,28 @@ def render_chart(diagram: dict) -> str:
                 body.append(_text(x, y - 10, f"{value:g}", 11, _INK))
             for first, second in zip(points, points[1:]):
                 body.append(_line(first[0], first[1], second[0], second[1], _BLUE_2, 2.5))
+        elif chart_type == "ogive":
+            # Ogive: cumulative frequency line chart
+            cum_values = []
+            cumulative = 0.0
+            for value in values:
+                cumulative += max(0.0, value)
+                cum_values.append(cumulative)
+            max_cum = max(cum_values) or 1.0
+            count = max(1, len(cum_values))
+            for index, cum_val in enumerate(cum_values):
+                x = left + slot * (index + 0.5)
+                y = bottom - (cum_val / max_cum) * (bottom - top)
+                body.append(_circle(x, y, 4, _BLUE_2, _BLUE_2, 1))
+                body.append(_text(x, y - 10, f"{cum_val:g}", 11, _INK))
+            # Draw cumulative line connecting all points
+            cum_points = []
+            for index, cum_val in enumerate(cum_values):
+                x = left + slot * (index + 0.5)
+                y = bottom - (cum_val / max_cum) * (bottom - top)
+                cum_points.append((x, y))
+            for first, second in zip(cum_points, cum_points[1:]):
+                body.append(_line(first[0], first[1], second[0], second[1], _BLUE_2, 2.5))
         else:
             for index, value in enumerate(values):
                 bar_w = slot * 0.55
@@ -826,6 +903,52 @@ def _pencil_style_svg(svg: str) -> str:
     return svg
 
 
+_STYLE_ACCENTS = {
+    "medical": ("#f0fdfa", "#0f766e"),
+    "molecule2d": ("#f5f3ff", "#5b21b6"),
+    "structure3d": ("#eff6ff", "#1e3a8a"),
+    "topographic": ("#fefce8", "#92400e"),
+}
+
+
+def _tinted_style_svg(svg: str, surface: str, accent: str) -> str:
+    """Apply a subject palette while keeping every label readable.
+
+    Only white surfaces and the standard ink stroke change. Template colours
+    are left alone so a multi-colour figure does not turn into a flat block.
+    """
+    def replace_colour(match: re.Match) -> str:
+        attribute = match.group(1).lower()
+        colour = match.group(2).lower()
+        if attribute == "fill":
+            if colour in {"#ffffff", "#fff", "#f8fafc", "#f9fafb"}:
+                return f'fill="{surface}"'
+            return match.group(0)
+        if colour in {"#0f172a", "#111827", "#1f2937"}:
+            return f'stroke="{accent}"'
+        return match.group(0)
+
+    svg = re.sub(r'\b(fill|stroke)="(#[0-9a-fA-F]{3,6})"', replace_colour, svg)
+    svg = re.sub(r'(<text\b[^>]*\bfill=")[^"]*(")', r'\1#0f172a\2', svg)
+    return svg
+
+
+def _line_style_svg(svg: str) -> str:
+    """Monochrome line art for Clean Vector / Schematic / Outline modes."""
+    def replace_colour(match: re.Match) -> str:
+        attribute = match.group(1).lower()
+        colour = match.group(2).lower()
+        if attribute == "fill":
+            if colour in {"#ffffff", "#fff", "#f8fafc", "#f9fafb"}:
+                return 'fill="#ffffff"'
+            return 'fill="none"'
+        return 'stroke="#0f172a"'
+
+    svg = re.sub(r'\b(fill|stroke)="(#[0-9a-fA-F]{3,6})"', replace_colour, svg)
+    svg = re.sub(r'(<text\b[^>]*\bfill=")[^"]*(")', r'\1#0f172a\2', svg)
+    return svg
+
+
 def render_diagram_svg(diagram: dict, style: str = "color") -> bytes:
     """Render a normalised diagram spec into safe SVG bytes."""
     if not isinstance(diagram, dict):
@@ -872,8 +995,14 @@ def render_diagram_svg(diagram: dict, style: str = "color") -> bytes:
         )
     if not svg.startswith("<svg"):
         raise DiagramRenderError("Renderer returned invalid SVG.")
-    if normalise_diagram_style(style) == "pencil":
+    normalised_style = normalise_diagram_style(style)
+    if normalised_style == "pencil":
         svg = _pencil_style_svg(svg)
+    elif normalised_style in {"schematic", "outline"}:
+        svg = _line_style_svg(svg)
+    elif normalised_style in _STYLE_ACCENTS:
+        surface, accent = _STYLE_ACCENTS[normalised_style]
+        svg = _tinted_style_svg(svg, surface, accent)
     return svg.encode("utf-8")
 
 

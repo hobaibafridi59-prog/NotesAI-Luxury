@@ -16,13 +16,13 @@ from fpdf import FPDF
 # Default watermark configuration (can be overridden by app.py)
 WATERMARK_TEXT = "Lucky's 59"
 WATERMARK_ENABLED = True
-WATERMARK_OPACITY = 0.13
-WATERMARK_ANGLE = 35
-WATERMARK_COLOR = (180, 180, 180)
-WATERMARK_FONT_SIZE = 14
-WATERMARK_COLS = 3
-WATERMARK_ROWS = 5
-WATERMARK_SHIFT_FACTOR = 0.5
+# Opaqueness is applied indirectly via text color; keep light.
+WATERMARK_ANGLE = 15
+WATERMARK_COLOR = (230, 230, 230)  # nearly white
+WATERMARK_FONT_SIZE = 10
+WATERMARK_COLS = 2
+WATERMARK_ROWS = 2
+WATERMARK_SHIFT_FACTOR = 0.2
 
 
 def _draw_tiled_watermark(pdf):
