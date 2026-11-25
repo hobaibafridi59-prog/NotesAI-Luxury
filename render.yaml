@@ -4,9 +4,25 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT app:app
+    # One worker on purpose: study sets, activity and notifications are JSON
+    # files guarded by in-process locks. Two gunicorn workers can lose writes.
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT --timeout 120 app:app
     envVars:
       - key: NOTESAI_ADMIN_TOKEN
         generateValue: true
+      # Stable JWT secret: without it auth.py writes a new secret to .env on
+      # every fresh deploy, invalidating all existing user sessions.
+      - key: NOTESAI_JWT_SECRET
+        generateValue: true
       - key: NOTESAI_HOST
         value: 0.0.0.0
+      - key: NOTESAI_DEBUG
+        value: "0"
+      - key: NOTESAI_SUPPORT_EMAIL
+        value: support@notesai.app
+      - key: AI_PROVIDER
+        value: openrouter
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
