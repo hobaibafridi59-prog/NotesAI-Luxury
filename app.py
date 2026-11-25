@@ -13533,6 +13533,10 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
 </html>
 """
 
+# Compile the large inline page template once at import time.
+# render_template_string() recompiles this ~380 KB string on every request.
+_PAGE_TEMPLATE = app.jinja_env.from_string(HTML)
+
 # ============================================================
 # AI PROVIDER STATUS / SETTINGS API
 # ============================================================
@@ -15377,7 +15381,7 @@ def home():
     user = get_current_user()
     user_name = user.get('name', 'User') if user else 'Guest'
     user_initial = user_name[0].upper() if user_name else 'G'
-    return render_template_string(HTML, page='dashboard', page_title='Dashboard', page_desc='', stats=stats, activity=activity, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'), user_name=user_name, user_initial=user_initial)
+    return _PAGE_TEMPLATE.render( page='dashboard', page_title='Dashboard', page_desc='', stats=stats, activity=activity, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'), user_name=user_name, user_initial=user_initial)
 
 @app.route("/health")
 def health():
@@ -15406,7 +15410,7 @@ def navigation_page(page):
     user = get_current_user()
     user_name = user.get('name', 'User') if user else 'Guest'
     user_initial = user_name[0].upper() if user_name else 'G'
-    return render_template_string(HTML, page=page, page_title=title, page_desc=description, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'), user_name=user_name, user_initial=user_initial, support_email=os.getenv('NOTESAI_SUPPORT_EMAIL','support@notesai.app'))
+    return _PAGE_TEMPLATE.render( page=page, page_title=title, page_desc=description, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'), user_name=user_name, user_initial=user_initial, support_email=os.getenv('NOTESAI_SUPPORT_EMAIL','support@notesai.app'))
 
 if __name__ == "__main__":
     try:
