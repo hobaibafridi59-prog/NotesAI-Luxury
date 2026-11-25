@@ -50,7 +50,7 @@ echo ""
 # 4. Install dependencies
 echo "4. Installing dependencies..."
 pip install --upgrade pip -q 2>/dev/null
-pip install -r requirements.txt -q 2>/dev/null
+pip install -r requirements.txt -q
 echo "   Installed:"
 pip list 2>/dev/null | grep -iE "flask|fpdf|pillow|gunicorn" | sed 's/^/     /'
 echo ""
@@ -111,35 +111,25 @@ echo ""
 echo "7. Checking environment variables..."
 check_env() {
     val=$(python -c "import os; print(os.environ.get('$1', ''))" 2>/dev/null)
+    if [ -z "$val" ] && [ -f .env ]; then
+        val=$(grep -E "^$1=" .env | head -1 | cut -d= -f2-)
+    fi
     if [ -z "$val" ]; then
-        echo "   WARN: $1: NOT SET (check .env file)"
+        echo "   WARN: $1: NOT SET (dashboard or .env)"
     else
         echo "   OK: $1: SET (length: ${#val})"
     fi
 }
-check_env "GEMINI_API_KEY"
 check_env "AI_PROVIDER"
-check_env "NOTESAI_ADMIN_TOKEN"
-check_env "NOTESAI_JWT_SECRET"
-check_env "NOTESAI_HOST"
-check_env "NOTESAI_DEBUG"
-check_env() {
-    val=$(python -c "import os; print(os.environ.get('$1', ''))" 2>/dev/null)
-    if [ -z "$val" ]; then
-        echo "   WARN: $1: NOT SET"
-    else
-        echo "   OK: $1: SET (length: ${#val})"
-    fi
-}
+check_env "OPENROUTER_API_KEY"
 check_env "GEMINI_API_KEY"
-check_env "AI_PROVIDER"
 check_env "NOTESAI_ADMIN_TOKEN"
 check_env "NOTESAI_JWT_SECRET"
 check_env "NOTESAI_HOST"
 check_env "NOTESAI_DEBUG"
 echo ""
 
-# 7. Verify .env file
+# 8. Verify .env file
 echo "8. Checking .env file..."
 if [ -f ".env" ]; then
     echo "   OK: .env exists"
@@ -151,7 +141,7 @@ else
 fi
 echo ""
 
-# 8. Test Python imports
+# 9. Test Python imports
 echo "9. Testing Python imports..."
 python -c "
 import flask, fpdf, PIL, requests, json, os, sys
@@ -165,7 +155,7 @@ print('   OK: All modules import successfully')
 " 2>&1 | sed 's/^/   /'
 echo ""
 
-# 9. Test WSGI import
+# 10. Test WSGI import
 echo "10. Testing WSGI import..."
 python -c "
 import sys, os
@@ -177,7 +167,7 @@ print(f'   App name: {application.name}')
 " 2>&1 | sed 's/^/   /'
 echo ""
 
-# 10. Test Flask startup
+# 11. Test Flask startup
 echo "11. Testing Flask startup..."
 python -c "
 import sys, os
@@ -192,23 +182,32 @@ print(f'   Dashboard: {r.status_code} ({len(r.data)} bytes)')
 " 2>&1 | sed 's/^/   /'
 echo ""
 
-# 11. Verify existing data
+# 12. Verify existing data
 echo "12. Verifying existing data..."
-python -c "
+python - <<'PYDATA' | sed 's/^/   /'
 import json, os
-docs = json.load(open('documents.json'))
-acts = json.load(open('activity.json'))
-stats = json.load(open('stats.json'))
-billing = json.load(open('billing.json'))
-print(f'   Documents: {len(docs)}')
-print(f'   Activity: {len(acts)}')
+
+def load(name, default):
+    try:
+        with open(name, encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+docs = load('documents.json', [])
+acts = load('activity.json', [])
+stats = load('stats.json', {})
+billing = load('billing.json', {'plan': 'free', 'status': 'free'})
+pdf_count = len(os.listdir('documents')) if os.path.isdir('documents') else 0
+print(f'   Documents: {len(docs) if isinstance(docs, list) else 0}')
+print(f'   Activity: {len(acts) if isinstance(acts, list) else 0}')
 print(f'   Stats: {stats}')
-print(f'   Billing: plan={billing[\"plan\"]}, status={billing[\"status\"]}')
-print(f'   PDF files: {len(os.listdir(\"documents\"))}')
-" 2>&1 | sed 's/^/   /'
+print(f'   Billing: plan={billing.get("plan", "free")}, status={billing.get("status", "free")}')
+print(f'   PDF files: {pdf_count}')
+PYDATA
 echo ""
 
-# 12. Final readiness
+# 13. Final readiness
 echo "=== DEPLOYMENT READY ==="
 echo ""
 echo "Next steps (on PythonAnywhere dashboard):"
