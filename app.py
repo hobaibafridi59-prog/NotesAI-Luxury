@@ -250,6 +250,7 @@ OPENROUTER_MODELS_TTL_SECONDS = 6 * 60 * 60
 # destructively: unknown keys are preserved and counters are clamped at zero.
 STATS_FILE = PROJECT_ROOT / "stats.json"
 ACTIVITY_FILE = PROJECT_ROOT / "activity.json"
+NOTIFICATIONS_FILE = PROJECT_ROOT / "notifications.json"
 
 # Lightweight, file-based document history. No external database is required.
 # PDF files live in documents/ and metadata (never API keys) lives in
@@ -308,6 +309,7 @@ DEFAULT_STATS = {"total_documents": 0, "in_progress": 0, "completed": 0, "failed
 
 _STATS_LOCK = threading.RLock()
 _ACTIVITY_LOCK = threading.RLock()
+_NOTIFICATION_LOCK = threading.RLock()
 _DOCUMENTS_LOCK = threading.RLock()
 _JOB_LOCK = threading.Lock()
 _PROVIDER_LOCK = threading.RLock()
@@ -374,6 +376,37 @@ def add_activity(action, detail, status="completed", **extra):
         entry.update({key: value for key, value in extra.items() if value is not None})
         activity.insert(0, entry)
         save_activity(activity[:200])
+
+
+def load_notification_state():
+    if NOTIFICATIONS_FILE.is_file():
+        try:
+            parsed = json.loads(NOTIFICATIONS_FILE.read_text())
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+def save_notification_state(state):
+    with _NOTIFICATION_LOCK:
+        tmp = NOTIFICATIONS_FILE.with_name(NOTIFICATIONS_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        os.replace(tmp, NOTIFICATIONS_FILE)
+        try:
+            os.chmod(NOTIFICATIONS_FILE, 0o600)
+        except Exception:
+            pass
+
+
+def _notification_is_read(timestamp, read_at):
+    if not timestamp or not read_at:
+        return False
+    try:
+        return datetime.fromisoformat(timestamp) <= datetime.fromisoformat(read_at)
+    except Exception:
+        return str(timestamp) <= str(read_at)
 
 
 def _save_json_private(path, payload, lock, limit=None):
@@ -1285,6 +1318,10 @@ SMART_ANALYSIS_PROMPT = (
     "a separate shape for each labelled part. Add leader connectors with points [x1,y1,x2,y2] from each "
     "label to the named part. Do not connect every label to one central point. Do not return only labels and "
     "do not invent missing parts.\n"
+    "6d. Recreate the diagram with high fidelity. Do not skip internal details (labels, lines, structural parts). "
+    "If the diagram is complex (like anatomy or circuits), ensure all components are drawn. "
+    "Never leave empty placeholder boxes: every box must contain its real part or be replaced by a traced shape. "
+    "If a part is visible in the source, it must be present in the scene.\n"
     "7. Preserve original labels. Correct only an obvious spelling typo and note it. "
     "Never invent missing labels, scientific facts, values, or connections.\n"
     "8. Mark unclear content as type uncertain or add it to diagram.uncertain. Lower confidence when unsure.\n"
@@ -1321,6 +1358,9 @@ DIAGRAM_SCENE_REPAIR_PROMPT = (
     "to the named part. from/to ids may also be included. Never connect all labels to one central point.\n"
     "3b. Keep shapes simple: a polygon with 4-12 points or a short path is enough. Do not trace every pencil "
     "stroke. Approximate the visible region, but keep the correct position and relationship.\n"
+    "3c. Recreate the diagram with high fidelity. Do not skip internal details (labels, lines, structural parts). "
+    "If the diagram is complex (like anatomy or circuits), ensure all components are drawn. "
+    "Never leave empty placeholder boxes: every shape must contain or trace a visible part.\n"
     "4. If the crop is too unclear to recreate safely, return an empty elements list and review_required true "
     "with a short reason. Never invent a structure.\n"
     "5. Return every requested diagram id exactly once. Detected diagrams:\n{{DIAGRAMS}}\n"
@@ -3180,7 +3220,8 @@ def generate_smart_pdf(analysis, options=None, source_pages=None, include_diagra
         elif block_type == 'page_break':
             pdf.add_page()
 
-    pdf.add_page()
+    if title or subtitle:
+        pdf.add_page()
     if title:
         title_text = shape_text_for_pdf(title)
         title_align = 'R' if text_is_rtl_dominant(title) else 'C'
@@ -3209,8 +3250,8 @@ def generate_smart_pdf(analysis, options=None, source_pages=None, include_diagra
         pdf.multi_cell(w=0, h=6.5, text=shape_text_for_pdf(subtitle), align='C')
         pdf.ln(6)
 
-    if options.get('coverPage'):
-        pdf.add_page()
+    # Cover page is rendered on the same page as title/subtitle
+    # to avoid blank pages.
 
     if toc_enabled:
         def render_toc(toc_pdf, outline):
@@ -4117,6 +4158,32 @@ def _diagram_needs_repair(diagram):
     required_shapes = max(1, min(6, len(labels) // 2 + 1))
     if shape_count < required_shapes:
         return True
+
+    text_count = sum(
+        1 for element in elements
+        if element.get("kind") == "text" or str(element.get("shape") or "").lower() == "text"
+    )
+    connector_count = sum(1 for element in elements if element.get("kind") == "connector")
+    rect_count = sum(1 for element in elements if str(element.get("shape") or "").lower() == "rect")
+    if len(labels) >= 3 and text_count < max(1, len(labels) // 2):
+        # Labels were detected but most of them are not placed in the scene.
+        return True
+
+    category = str(diagram.get("category") or "").lower()
+    diagram_type = str(diagram.get("type") or "").lower()
+    organic = category in {
+        "biology", "anatomy", "human_body", "heart", "cell", "plant", "medicine",
+    } or diagram_type in {
+        "heart", "cell", "plant", "human_body", "anatomy", "brain", "eye", "ear",
+        "kidney", "lungs", "skeleton", "muscle", "nerve", "digestive",
+    }
+    if organic and len(labels) >= 4:
+        # Anatomy must use curved/traced parts, not a grid of empty rectangles.
+        if shape_count >= 3 and rect_count >= max(3, int(shape_count * 0.7)):
+            return True
+        if _scene_curved_shape_count(diagram.get("scene") or {}) == 0 and connector_count == 0:
+            return True
+
     try:
         render_diagram_svg(diagram, style="color")
     except Exception:
@@ -4155,6 +4222,19 @@ def _repair_label_only_diagrams(pages, page_results, provider):
                     "Diagram scene repair failed provider=%s model=%s diagram=%s reason=%s",
                     provider, model or "", diagram.get("id") or "", sanitize_provider_message(error),
                 )
+                # Never ship an incomplete scene (for example empty vertebra
+                # boxes). When a source crop exists, keep the accurate crop.
+                if diagram.get("source_bbox"):
+                    diagram["use_original"] = True
+                    diagram["review_required"] = True
+                    fallback_warnings = [
+                        warning for warning in diagram.get("warnings") or []
+                        if "original diagram crop" not in warning.lower()
+                    ]
+                    fallback_warnings.append(
+                        "The AI recreation was incomplete, so the original diagram crop is preserved for accuracy."
+                    )
+                    diagram["warnings"] = fallback_warnings
     return repaired_total
 
 
@@ -4844,6 +4924,7 @@ html { scroll-behavior: smooth; }
     box-shadow: var(--shadow-2xl);
     border-radius: 0 var(--radius-2xl) var(--radius-2xl) 0;
     border-right: none;
+    z-index: var(--z-modal);
   }
   .sidebar.open { transform: translateX(0); }
   .app { grid-template-columns: 1fr; }
@@ -4944,25 +5025,6 @@ html { scroll-behavior: smooth; }
 .nav-text { white-space: nowrap; }
 
 /* Side Bottom */
-.side-bottom {
-  margin-top: auto;
-  padding: 16px;
-  background: var(--grad-card);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-lg);
-  backdrop-filter: var(--glass-blur);
-}
-.side-bottom .premium-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--accent-primary);
-  margin-bottom: 8px;
-}
-.side-bottom p { font-size: 12px; line-height: 1.6; color: var(--text-muted); }
-
 /* Main Content */
 .main {
   margin-left: var(--sidebar-width);
@@ -4990,11 +5052,21 @@ html { scroll-behavior: smooth; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 24px;
-  margin-bottom: 32px;
-  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 24px;
+  flex-wrap: nowrap;
+  min-height: var(--header-height);
+  position: sticky;
+  top: 0;
+  z-index: var(--z-fixed);
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  color: var(--white);
+  padding: 0 24px;
+  border-radius: 0;
+  border-bottom: 1px solid rgba(148,163,184,0.18);
+  box-shadow: 0 10px 30px rgba(15,23,42,0.18), inset 0 -1px 0 rgba(255,255,255,0.05);
 }
-.topbar-left { display: flex; flex-direction: column; gap: 4px; }
+.topbar-left { display: flex; align-items: center; gap: 12px; }
 .eyebrow {
   font-size: 11px;
   font-weight: 600;
@@ -5019,43 +5091,222 @@ html { scroll-behavior: smooth; }
   font-weight: 700;
   color: var(--white);
   background: var(--grad-primary);
-  box-shadow: 0 4px 14px rgba(30,58,138,0.25), 0 0 0 1px rgba(30,58,138,0.1) inset;
+  box-shadow: 0 4px 14px rgba(30,58,138,0.25), 0 0 0 2px rgba(255,255,255,0.18);
   flex-shrink: 0;
 }
+.topbar-center { flex: 1; max-width: 500px; margin: 0 24px; }
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+.topbar .logo { width: 38px; height: 38px; font-size: 16px; font-weight: 800; border-radius: var(--radius-md); }
+.topbar-search { position: relative; display: flex; align-items: center; width: 100%; }
+.topbar-search-icon { position: absolute; left: 14px; color: var(--text-muted); font-size: 14px; pointer-events: none; z-index: 1; }
+.topbar-search input {
+  width: 100%;
+  padding: 10px 16px 10px 40px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--glass-border-strong);
+  background: var(--glass-bg);
+  box-shadow: inset 0 1px 2px rgba(15,23,42,0.10);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+  transition: border-color var(--transition-base), box-shadow var(--transition-base), background var(--transition-base);
+}
+.topbar-search input::placeholder { color: var(--text-muted); }
+.topbar-search input:focus { border-color: var(--accent-primary); box-shadow: 0 0 0 3px var(--accent-light); background: #ffffff; }
 
-/* Welcome Section */
+/* Mobile / small tablet: brand + actions on row 1, search drops to row 2 */
+@media (max-width: 900px) {
+  .topbar {
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 10px;
+    padding: 10px 12px;
+    height: auto;
+    min-height: var(--header-height);
+    border-radius: 0;
+  }
+  .topbar-left {
+    order: 1;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .topbar-right {
+    order: 2;
+    flex: 0 0 auto;
+    margin-left: auto;
+    gap: 8px;
+  }
+  .topbar-center {
+    order: 3;
+    flex: 0 0 100%;
+    width: 100%;
+    max-width: 100%;
+    margin: 6px 0 0 0;
+  }
+  .topbar-search { width: 100%; }
+  .brand-copy { min-width: 0; }
+}
+.btn-premium {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 14px; border: 1px solid rgba(251,191,36,0.55); border-radius: var(--radius-full);
+  background: rgba(251,191,36,0.12); color: #fbbf24; font-size: 12px; font-weight: 700;
+  text-decoration: none; cursor: pointer; transition: all var(--transition-base);
+  box-shadow: 0 0 18px rgba(251,191,36,0.18);
+}
+.btn-premium:hover { background: rgba(251,191,36,0.24); box-shadow: 0 0 28px rgba(251,191,36,0.34); transform: translateY(-1px); }
+.btn-notification { position: relative; background: transparent; border: none; color: var(--white); cursor: pointer; padding: 8px; font-size: 18px; border-radius: var(--radius-full); display: inline-flex; align-items: center; justify-content: center; transition: background var(--transition-fast); }
+.btn-notification:hover { background: rgba(255,255,255,0.14); }
+.notif-icon { position: relative; z-index: 1; }
+.notif-dot { position: absolute; top: 3px; right: 3px; width: 8px; height: 8px; background: #ef4444; border-radius: 50%; border: 2px solid #0f172a; animation: notifPulse 2.2s infinite; }
+@keyframes notifPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55);} 50% { box-shadow: 0 0 0 6px rgba(239,68,68,0);} }
+.topbar-menu-wrap { position: relative; display: inline-flex; }
+.topbar-menu { position: absolute; top: calc(100% + 12px); right: 0; width: 300px; max-width: 82vw; background-color: #ffffff; border: 1px solid var(--glass-border); border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); z-index: 1400; overflow: hidden; animation: topbarMenuIn var(--transition-bounce); display: none; }
+.topbar-menu.show { display: block; }
+.dropdown-menu {
+  background-color: #ffffff !important;
+  opacity: 1 !important;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  z-index: 9999;
+  position: absolute;
+}
+@keyframes topbarMenuIn { from { opacity: 0; transform: translateY(-8px) scale(0.97); } to { opacity: 1; transform: translateY(0) scale(1); } }
+.topbar-menu-header { padding: 14px 16px; font-weight: 700; font-size: 14px; color: var(--text-primary); border-bottom: 1px solid var(--glass-border); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.notif-count { background: #ef4444; color: #fff; font-size: 11px; font-weight: 700; border-radius: var(--radius-full); padding: 2px 8px; }
+.topbar-menu-item { display: flex; align-items: center; gap: 12px; padding: 12px 16px; font-size: 13px; font-weight: 500; color: var(--text-secondary); text-decoration: none; border: none; background: none; width: 100%; text-align: left; cursor: pointer; transition: background var(--transition-fast); font-family: inherit; box-sizing: border-box; }
+.topbar-menu-item:hover { background: var(--navy-50); color: var(--text-primary); }
+.topbar-menu-item + .topbar-menu-item { border-top: 1px solid var(--glass-border); }
+.topbar-menu-icon { width: 34px; height: 34px; border-radius: var(--radius-md); background: var(--navy-50); display: grid; place-items: center; font-size: 15px; flex-shrink: 0; }
+.topbar-menu-text { display: flex; flex-direction: column; min-width: 0; }
+.topbar-menu-text strong { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.topbar-menu-text p { font-size: 12px; color: var(--text-muted); margin: 2px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar-menu-time { margin-left: auto; font-size: 11px; color: var(--text-muted); flex-shrink: 0; }
+.topbar-menu-sep { height: 1px; background: var(--glass-border); margin: 4px 0; }
+.topbar-menu-label { padding: 10px 16px 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-muted); }
+.topbar-avatar-wrap { position: relative; display: inline-flex; }
+.topbar-menu-account { width: 250px; }
+.topbar-menu-logout { color: var(--error); }
+.notif-dot[hidden], .notif-count[hidden] { display: none; }
+.topbar-menu-notif { width: 340px; max-width: 88vw; }
+.notif-list { max-height: 340px; overflow-y: auto; }
+.notif-item { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--glass-border); transition: background var(--transition-fast); }
+.notif-item:last-child { border-bottom: none; }
+.notif-item:hover { background: var(--navy-50); }
+.notif-item.is-unread { background: rgba(59,130,246,0.055); }
+.notif-item-icon { width: 34px; height: 34px; flex: 0 0 34px; border-radius: 10px; display: grid; place-items: center; }
+.notif-item-icon svg { width: 16px; height: 16px; }
+.notif-item-icon.is-success { background: #ecfdf5; color: #059669; }
+.notif-item-icon.is-error { background: #fef2f2; color: #dc2626; }
+.notif-item-icon.is-info { background: #eff6ff; color: #2563eb; }
+.notif-item-body { min-width: 0; flex: 1; }
+.notif-item-body strong { display: block; font-size: 12.5px; font-weight: 700; color: var(--text-primary); line-height: 1.35; }
+.notif-item-body p { margin: 2px 0 0; font-size: 11px; color: var(--text-muted); line-height: 1.45; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.notif-item-time { display: block; margin-top: 4px; font-size: 10px; color: var(--text-muted); }
+.notif-unread-dot { width: 7px; height: 7px; border-radius: 50%; background: #2563eb; margin-top: 6px; flex: 0 0 7px; }
+.notif-empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 5px; padding: 30px 20px; }
+.notif-empty-icon { width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; background: #ecfdf5; color: #059669; margin-bottom: 4px; }
+.notif-empty-icon svg { width: 20px; height: 20px; }
+.notif-empty strong { font-size: 13px; font-weight: 700; color: var(--text-primary); }
+.notif-empty p { margin: 0; font-size: 11.5px; color: var(--text-muted); line-height: 1.5; max-width: 240px; }
+.notif-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; }
+.notif-mark-read, .notif-view-all { background: none; border: none; padding: 0; font-family: inherit; font-size: 11.5px; font-weight: 700; color: var(--accent-primary); cursor: pointer; text-decoration: none; }
+.notif-mark-read:disabled { color: var(--text-muted); cursor: default; }
+.notif-mark-read:not(:disabled):hover, .notif-view-all:hover { text-decoration: underline; }
+
+/* Panel entrance */
+.panel { animation: panelIn 0.45s var(--transition-bounce); }
+@keyframes panelIn { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+
+/* Welcome Section - Premium Sky + 3D Books */
 .welcome {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 24px;
-  margin-bottom: 24px;
-  padding: 24px;
-  background: var(--grad-hero);
+  gap: 20px;
+  margin-bottom: 20px;
+  padding: 16px 20px;
+  background: linear-gradient(135deg, #7dd3fc 0%, #38bdf8 48%, #2563eb 100%);
   border-radius: var(--radius-2xl);
   color: var(--white);
   position: relative;
   overflow: hidden;
+  flex-wrap: nowrap;
+  box-shadow: var(--shadow-2xl), inset 0 1px 0 rgba(255,255,255,0.35);
 }
 .welcome::before {
   content: '';
   position: absolute;
-  top: -50%; right: -20%;
-  width: 60%; height: 200%;
-  background: radial-gradient(ellipse, rgba(255,255,255,0.08) 0%, transparent 70%);
+  top: -60%; right: -10%;
+  width: 70%; height: 260%;
+  background: radial-gradient(ellipse, rgba(255,255,255,0.22) 0%, transparent 70%);
   pointer-events: none;
 }
-.welcome-content { position: relative; z-index: 1; max-width: 600px; }
+.hero-glow {
+  position: absolute;
+  top: -40%; left: -10%;
+  width: 55%; height: 220%;
+  background: radial-gradient(ellipse, rgba(255,255,255,0.2) 0%, transparent 70%);
+  pointer-events: none;
+  animation: heroGlowPulse 5s ease-in-out infinite;
+}
+@keyframes heroGlowPulse { 0%,100% { opacity: 0.75; } 50% { opacity: 1; } }
+.welcome-content { position: relative; z-index: 1; max-width: 640px; flex: 1 1 auto; min-width: 0; }
 .welcome h2 {
-  font-size: clamp(22px, 3vw, 28px);
+  font-size: clamp(18px, 2.2vw, 24px);
   font-weight: 700;
   letter-spacing: -0.02em;
-  line-height: 1.3;
-  margin-bottom: 10px;
+  line-height: 1.25;
+  margin-bottom: 4px;
+  color: var(--white);
+  overflow-wrap: anywhere;
 }
-.welcome h2 span { color: var(--royal-blue-100); }
-.welcome p { font-size: 14px; line-height: 1.7; opacity: 0.9; }
-.welcome-action { position: relative; z-index: 1; flex-shrink: 0; }
+.welcome h2 span { color: #fefce8; }
+.welcome p { font-size: 13px; line-height: 1.5; opacity: 0.92; color: var(--white); margin: 0; }
+.welcome-action { position: relative; z-index: 1; display: inline-flex; align-items: center; gap: 7px; margin: 10px 0 0; padding: 9px 16px; font-size: 12px; align-self: flex-start; }
+.welcome-illustration { position: relative; z-index: 1; flex: 0 0 auto; width: 150px; height: 116px; }
+.illustration-inner { position: relative; width: 150px; height: 116px; transform-origin: top left; }
+.open-book-art { display: block; width: 100%; height: 100%; overflow: visible; animation: bookFloat 6s ease-in-out infinite; }
+@keyframes bookFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+@media (prefers-reduced-motion: reduce) { .open-book-art { animation: none; } }
+.book-stack { position: absolute; bottom: 0; left: 0; width: 146px; height: 40px; animation: bookStackFloat 5.5s ease-in-out infinite; }
+@keyframes bookStackFloat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+.book { position: absolute; bottom: 0; width: 44px; height: 32px; border-radius: 4px 6px 6px 4px; box-shadow: 0 8px 14px rgba(15,23,42,0.28); }
+.book-red { left: 0; background: linear-gradient(135deg, #f87171, #dc2626); transform: rotate(-9deg); }
+.book-blue { left: 30px; background: linear-gradient(135deg, #60a5fa, #1d4ed8); transform: rotate(6deg); }
+.book-green { left: 60px; background: linear-gradient(135deg, #34d399, #059669); transform: rotate(-5deg); }
+.open-book { position: absolute; bottom: 0; left: 38px; width: 100px; height: 48px; transform: rotate(8deg); transform-origin: bottom center; display: flex; }
+.open-book::before { content: ''; position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; background: rgba(30,58,138,0.3); transform: translateX(-50%); }
+.open-book .book-page { position: relative; flex: 1; background: #ffffff; border: 1px solid rgba(30,58,138,0.22); }
+.open-book .book-page.left { border-right: none; border-radius: 7px 0 0 7px; }
+.open-book .book-page.right { border-left: none; border-radius: 0 7px 7px 0; }
+.open-book .page-line { position: absolute; height: 2px; background: rgba(30,58,138,0.16); border-radius: 2px; }
+.open-book .book-page.left .page-line { left: 6px; right: 6px; }
+.open-book .book-page.right .page-line { left: 6px; right: 6px; }
+.open-book .page-line:nth-of-type(1) { top: 12px; }
+.open-book .page-line:nth-of-type(2) { top: 24px; }
+.open-book .page-line:nth-of-type(3) { top: 36px; }
+.grad-cap { position: absolute; top: -8px; right: -6px; font-size: 30px; filter: drop-shadow(0 6px 10px rgba(15,23,42,0.35)); transform: rotate(12deg); animation: capFloat 4.5s ease-in-out infinite; }
+@keyframes capFloat { 0%,100% { transform: rotate(12deg) translateY(0); } 50% { transform: rotate(12deg) translateY(-5px); } }
+@media (max-width: 768px) {
+  .welcome { flex-direction: row; align-items: center; gap: 12px; padding: 14px 16px; flex-wrap: nowrap; }
+  .welcome-content { flex: 1 1 auto; max-width: none; }
+  .welcome h2 { font-size: 17px; line-height: 1.25; margin-bottom: 3px; }
+  .welcome p { font-size: 12px; line-height: 1.45; }
+  .welcome-action { margin-top: 8px; padding: 8px 13px; font-size: 11px; }
+  .welcome-illustration { width: 105px; height: 81px; flex: 0 0 105px; }
+  .illustration-inner { transform: scale(0.7); }
+}
+@media (max-width: 420px) {
+  .welcome { padding: 12px 14px; gap: 8px; }
+  .welcome h2 { font-size: 15.5px; }
+  .welcome p { font-size: 11.5px; }
+  .welcome-action { padding: 7px 12px; font-size: 10.5px; }
+  .welcome-illustration { width: 87px; height: 67px; flex: 0 0 87px; }
+  .illustration-inner { transform: scale(0.58); }
+}
 
 /* Stats Grid */
 .stats {
@@ -5072,12 +5323,14 @@ html { scroll-behavior: smooth; }
   position: relative;
   overflow: hidden;
   padding: 20px;
-  background: var(--glass-bg-strong);
+  border: 1px solid transparent;
+  border-radius: var(--radius-xl);
+  background:
+    linear-gradient(var(--glass-bg-strong), var(--glass-bg-strong)) padding-box,
+    linear-gradient(135deg, rgba(59,130,246,0.55), rgba(139,92,246,0.45) 55%, rgba(37,99,235,0.25)) border-box;
   backdrop-filter: var(--glass-blur-strong);
   -webkit-backdrop-filter: var(--glass-blur-strong);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-xl);
-  box-shadow: var(--elev-2), var(--depth-line);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.08), var(--depth-line);
   transition: box-shadow var(--transition-base), transform var(--transition-base);
 }
 .stat-card::before {
@@ -5087,7 +5340,7 @@ html { scroll-behavior: smooth; }
   opacity: 0; transition: opacity var(--transition-base);
 }
 .stat-card { perspective: 1000px; transform-style: preserve-3d; }
-.stat-card:hover { box-shadow: var(--elev-3), var(--depth-line); transform: translateY(-4px) rotateX(2deg) translateZ(8px); }
+.stat-card:hover { box-shadow: 0 16px 36px rgba(15,23,42,0.14), var(--depth-line); transform: translateY(-4px) rotateX(2deg) translateZ(8px); }
 .stat-card:hover::before { opacity: 1; }
 .stat-card::after {
   content: '';
@@ -5106,11 +5359,24 @@ html { scroll-behavior: smooth; }
   border-radius: var(--radius-lg);
   display: grid;
   place-items: center;
-  font-size: 20px;
-  background: var(--accent-light);
-  color: var(--accent-primary);
+  background: linear-gradient(135deg, rgba(59,130,246,0.16), rgba(139,92,246,0.16));
+  color: #2563eb;
+  border: 1px solid rgba(59,130,246,0.18);
   flex-shrink: 0;
 }
+.stat-icon svg { width: 20px; height: 20px; }
+.topbar-search-icon svg { width: 14px; height: 14px; }
+.notif-icon svg { width: 18px; height: 18px; }
+.btn-premium svg { width: 14px; height: 14px; vertical-align: -2px; }
+.topbar-menu-icon svg { width: 16px; height: 16px; }
+.quick-action svg { width: 15px; height: 15px; flex-shrink: 0; }
+.plan-actions .btn-3d svg, .study-panel .btn-3d svg { width: 14px; height: 14px; vertical-align: -2px; }
+.empty-state-icon svg { width: 30px; height: 30px; }
+.recent-mini-icon svg { width: 17px; height: 17px; }
+.activity-icon svg { width: 20px; height: 20px; }
+.search-result-icon svg { width: 17px; height: 17px; }
+.order-icon svg { width: 19px; height: 19px; }
+.document-thumb svg { width: 30px; height: 30px; }
 .stat-value { font-size: 32px; font-weight: 700; letter-spacing: -0.03em; color: var(--text-primary); line-height: 1.1; margin-bottom: 4px; }
 .stat-desc { font-size: 12px; color: var(--text-muted); }
 
@@ -5179,8 +5445,8 @@ html { scroll-behavior: smooth; }
   letter-spacing: 0.1em;
   margin-bottom: 8px;
 }
-.panel h3 { font-size: 18px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.02em; }
-.panel p { font-size: 14px; color: var(--text-secondary); line-height: 1.6; margin-top: 4px; }
+.panel h3 { font-size: 19px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.02em; }
+.panel p { font-size: 13.5px; color: var(--text-muted); line-height: 1.65; margin-top: 5px; }
 
 /* Dropzone */
 .dropzone {
@@ -5200,22 +5466,31 @@ html { scroll-behavior: smooth; }
 }
 .dropzone:hover, .dropzone.drag-active {
   border-color: var(--accent-primary);
-  background: var(--accent-light);
+  background: linear-gradient(180deg, rgba(239,246,255,0.92), rgba(255,255,255,0.96));
+  box-shadow: 0 0 0 4px rgba(59,130,246,0.10), 0 16px 34px rgba(37,99,235,0.16);
 }
-.dropzone.drag-active { transform: scale(1.01); box-shadow: var(--shadow-glow); }
+.dropzone.drag-active { transform: scale(1.01); box-shadow: 0 0 0 6px rgba(59,130,246,0.14), var(--shadow-glow); }
 .dropzone-icon {
-  width: 56px;
-  height: 56px;
+  width: 58px;
+  height: 58px;
   border-radius: var(--radius-xl);
   display: grid;
   place-items: center;
-  font-size: 24px;
-  background: var(--accent-light);
-  color: var(--accent-primary);
+  background: linear-gradient(135deg, rgba(59,130,246,0.16), rgba(139,92,246,0.16));
+  color: #2563eb;
+  border: 1px solid rgba(59,130,246,0.18);
   margin-bottom: 16px;
-  transition: transform var(--transition-bounce);
+  animation: dropzonePulse 2.6s ease-in-out infinite;
 }
-.dropzone:hover .dropzone-icon { transform: rotate(-6deg) scale(1.05); }
+.dropzone-icon svg { width: 26px; height: 26px; transition: transform var(--transition-bounce); }
+.dropzone:hover .dropzone-icon svg { transform: translateY(-2px) scale(1.1); }
+@keyframes dropzonePulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(37,99,235,0.18); }
+  50% { box-shadow: 0 0 0 12px rgba(37,99,235,0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dropzone-icon { animation: none; }
+}
 .dropzone strong { display: block; font-size: 15px; font-weight: 600; color: var(--text-primary); margin-bottom: 6px; }
 .dropzone p { font-size: 13px; color: var(--text-muted); margin-bottom: 20px; }
 .dropzone .btn-outline { padding: 12px 24px; font-size: 13px; }
@@ -5335,7 +5610,7 @@ html { scroll-behavior: smooth; }
 .extract-actions { margin-top: 20px; }
 #extractBtn { width: 100%; padding: 14px 24px; }
 .extracted-label { display: block; margin: 20px 0 10px; font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
-#extractedText { width: 100%; min-height: 180px; padding: 14px; font-size: 13px; line-height: 1.7; color: var(--text-primary); background: var(--white); border: 1px solid var(--border-medium); border-radius: var(--radius-md); resize: vertical; transition: border-color var(--transition-fast), box-shadow var(--transition-fast); }
+#extractedText { width: 100%; min-height: 180px; padding: 14px; font-size: 13px; line-height: 1.7; color: var(--text-primary); background: var(--white); border: 1px solid var(--border-medium); border-radius: var(--radius-md); resize: vertical; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; transition: border-color var(--transition-fast), box-shadow var(--transition-fast); }
 #extractedText:focus { border-color: var(--accent-primary); box-shadow: var(--shadow-glow); outline: none; }
 
 /* Upload Actions */
@@ -5399,6 +5674,21 @@ html { scroll-behavior: smooth; }
 .empty-state-icon { width: 64px; height: 64px; border-radius: var(--radius-xl); background: var(--navy-100); color: var(--text-muted); display: grid; place-items: center; font-size: 28px; margin-bottom: 16px; }
 .empty-state h4 { font-size: 16px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
 .empty-state p { font-size: 13px; line-height: 1.6; max-width: 280px; }
+.empty-state.enhanced { padding: 24px 18px; }
+.empty-state-illustration {
+  width: 92px; height: 92px; margin: 0 auto 14px; border-radius: 24px;
+  display: grid; place-items: center; color: var(--accent-primary);
+  background: radial-gradient(circle at 35% 28%, #ffffff, #dbeafe);
+  box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.14), 0 10px 22px rgba(59, 130, 246, 0.14);
+}
+.empty-state-illustration svg { width: 62px; height: 62px; }
+.empty-state.enhanced .btn-3d { margin-top: 14px; }
+.empty-state.compact { padding: 14px 12px; }
+.empty-state.compact .empty-state-illustration { width: 52px; height: 52px; margin-bottom: 8px; border-radius: 15px; }
+.empty-state.compact .empty-state-illustration svg { width: 36px; height: 36px; }
+.empty-state.compact h4 { font-size: 13px; }
+.empty-state.compact p { font-size: 11px; margin-bottom: 8px; }
+.empty-state.compact .btn-3d { margin-top: 4px; padding: 7px 12px; font-size: 11px; }
 
 /* Footer */
 .footer { margin-top: 40px; padding: 24px 0; text-align: center; font-size: 11px; color: var(--text-muted); letter-spacing: 0.05em; border-top: 1px solid var(--border-light); }
@@ -5492,8 +5782,6 @@ html { scroll-behavior: smooth; }
 }
 .mobile-menu-btn:hover { transform: translateY(-4px); box-shadow: var(--shadow-3d-hover); }
 .mobile-menu-btn:active { transform: scale(0.96); box-shadow: var(--shadow-3d-press); }
-  top: 0; left: 50%;
-}
 
 /* Mobile Menu Button */
 .mobile-menu-btn {
@@ -5517,11 +5805,36 @@ html { scroll-behavior: smooth; }
 .skeleton-grid { grid-column: 1 / -1; width: 100%; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
 .skeleton-card { height: 128px; border-radius: var(--radius-lg); }
 .skeleton-row { height: 68px; }
+.skeleton-line { height: 12px; border-radius: 6px; }
+.skeleton-line.short { width: 55%; }
+.skeleton-mini-row { height: 52px; border-radius: 10px; }
+.skeleton-stat { height: 30px; width: 62%; border-radius: 8px; }
+.skeleton-block { display: grid; gap: 10px; }
+.notif-skeleton-row { height: 54px; border-radius: 10px; }
+.search-skeleton-list { display: grid; gap: 10px; }
+.search-skeleton-row { height: 64px; border-radius: 12px; }
+.admin-skeleton-row { height: 34px; border-radius: 8px; }
+.plan-bar.is-loading { background: linear-gradient(90deg, var(--navy-100) 25%, var(--navy-200) 50%, var(--navy-100) 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; }
+.plan-title-wrap .skeleton-line { height: 22px; width: 58%; }
+input, textarea, select { scroll-margin-bottom: 24px; }
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+/* Full-page shimmer shown while a new page is being fetched. */
+.page-transition { position: fixed; inset: 0; z-index: calc(var(--z-toast) - 10); display: none; padding: 24px; background: var(--bg-primary); overflow: hidden; }
+.page-transition.show { display: block; animation: pageFadeIn 0.18s ease; }
+.page-transition-inner { max-width: 1180px; margin: 0 auto; display: grid; gap: 16px; }
+.page-transition-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.page-transition-head .skeleton:first-child { width: 34%; height: 34px; }
+.page-transition .skeleton-card { height: 160px; }
+.page-transition .skeleton-grid { grid-column: auto; }
+@keyframes pageFadeIn { from { opacity: 0; } to { opacity: 1; } }
+@media (max-width: 640px) {
+  .page-transition { padding: 14px; }
+  .page-transition .skeleton-card { height: 118px; }
+}
 .spinner { width: 20px; height: 20px; border: 2px solid var(--border-light); border-top-color: var(--accent-primary); border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.btn-loading { position: relative; color: transparent !important; pointer-events: none; }
-.btn-loading::after { content: ''; position: absolute; width: 20px; height: 20px; border: 2px solid currentColor; border-top-color: var(--white); border-radius: 50%; animation: spin 0.8s linear infinite; }
+.btn-loading { position: relative; pointer-events: none; opacity: 0.7; cursor: not-allowed; }
+.btn-loading::after { display: none; }
 
 /* ============================================================
    TOAST NOTIFICATIONS
@@ -5543,9 +5856,10 @@ html { scroll-behavior: smooth; }
   font-size: 13px;
   color: var(--text-primary);
   pointer-events: auto;
-  animation: slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  animation: toastIn 0.34s var(--transition-bounce);
 }
 @keyframes slideIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toastIn { from { opacity: 0; transform: translateX(24px) scale(0.96); } to { opacity: 1; transform: translateX(0) scale(1); } }
 .toast.success { border-left: 4px solid var(--success); }
 .toast.error { border-left: 4px solid var(--error); }
 .toast.warning { border-left: 4px solid var(--warning); }
@@ -5557,6 +5871,30 @@ html { scroll-behavior: smooth; }
 .toast.info .toast-icon { color: var(--accent-primary); }
 .toast-close { margin-left: auto; padding: 4px; color: var(--text-muted); border-radius: var(--radius-sm); }
 .toast-close:hover { background: var(--navy-100); color: var(--text-primary); }
+.toast.success { background: #f0fdf4; border-color: #bbf7d0; }
+.toast.error { background: #fef2f2; border-color: #fecaca; }
+.toast.warning { background: #fffbeb; border-color: #fde68a; }
+.toast.success .toast-icon, .toast.error .toast-icon,
+.toast.warning .toast-icon, .toast.info .toast-icon {
+  width: 28px; height: 28px; border-radius: var(--radius-full);
+  display: grid; place-items: center; font-size: 14px; font-weight: 800;
+}
+.toast.success .toast-icon { background: #dcfce7; color: #15803d; }
+.toast.error .toast-icon { background: #fee2e2; color: #b91c1c; }
+.toast.warning .toast-icon { background: #fef3c7; color: #b45309; }
+.toast.info .toast-icon { background: var(--accent-light); color: var(--accent-primary); }
+.toast.toast-out { animation: toastOut 0.18s ease forwards; }
+@keyframes toastOut { to { opacity: 0; transform: translateX(24px) scale(0.96); } }
+[data-theme="dark"] .toast.success, [data-theme="graphite"] .toast.success { background: #052e1b; border-color: #166534; }
+[data-theme="dark"] .toast.error, [data-theme="graphite"] .toast.error { background: #450a0a; border-color: #991b1b; }
+[data-theme="dark"] .toast.warning, [data-theme="graphite"] .toast.warning { background: #422006; border-color: #92400e; }
+[data-theme="dark"] .toast.success .toast-icon, [data-theme="graphite"] .toast.success .toast-icon { background: #064e3b; color: #6ee7b7; }
+[data-theme="dark"] .toast.error .toast-icon, [data-theme="graphite"] .toast.error .toast-icon { background: #7f1d1d; color: #fca5a5; }
+[data-theme="dark"] .toast.warning .toast-icon, [data-theme="graphite"] .toast.warning .toast-icon { background: #78350f; color: #fcd34d; }
+[data-theme="dark"] .empty-state-illustration, [data-theme="graphite"] .empty-state-illustration {
+  background: radial-gradient(circle at 35% 28%, #1e293b, #0b1120);
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.2), 0 10px 22px rgba(0, 0, 0, 0.3);
+}
 
 /* ============================================================
    PAGE-SPECIFIC STYLES (for navigation pages)
@@ -5565,8 +5903,8 @@ html { scroll-behavior: smooth; }
   display: flex; align-items: center; justify-content: space-between;
   gap: 16px; margin-bottom: 32px; flex-wrap: wrap;
 }
-.page-title { font-size: clamp(24px, 3vw, 32px); font-weight: 700; letter-spacing: -0.03em; }
-.page-desc { font-size: 14px; color: var(--text-secondary); margin-top: 4px; }
+.page-title { font-size: clamp(26px, 3.2vw, 34px); font-weight: 800; letter-spacing: -0.035em; color: var(--text-primary); }
+.page-desc { font-size: 13.5px; font-weight: 400; color: var(--text-muted); margin-top: 6px; line-height: 1.6; }
 
 /* My Notes - Document Grid */
 .document-grid {
@@ -5704,6 +6042,7 @@ html { scroll-behavior: smooth; }
   z-index: 2;
 }
 .file-item .file-remove:hover { background: var(--error); }
+.file-item .file-remove svg { width: 14px; height: 14px; }
 .file-item .file-badge {
   display: inline-flex;
   align-items: center;
@@ -5820,8 +6159,10 @@ html { scroll-behavior: smooth; }
   padding: 18px;
   background: rgba(15,23,42,0.55);
   backdrop-filter: blur(5px);
+  transition: opacity var(--transition-base);
 }
-.modal-backdrop.open { display: flex; }
+.modal-backdrop.open { display: flex; opacity: 0; animation: modalIn 0.28s var(--transition-bounce); }
+@keyframes modalIn { from { opacity: 0; transform: translateY(16px) scale(0.96); } to { opacity: 1; transform: translateY(0) scale(1); } }
 .pdf-modal {
   display: flex;
   flex-direction: column;
@@ -5905,25 +6246,48 @@ html { scroll-behavior: smooth; }
 .toast-action:hover { background: var(--accent-primary); color: var(--white); }
 .toast { pointer-events: auto; }
 
-/* Accessible tooltips */
+/* Accessible tooltips: hover on desktop, long-press on touch devices */
 [data-tooltip] { position: relative; }
-[data-tooltip]:hover::after, [data-tooltip]:focus-visible::after {
+[data-tooltip]::after {
   content: attr(data-tooltip);
   position: absolute;
   left: 50%;
-  bottom: calc(100% + 7px);
-  transform: translateX(-50%);
-  z-index: var(--z-toast);
-  max-width: 220px;
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-  background: var(--navy-900);
-  color: var(--white);
-  font-size: 10px;
-  line-height: 1.4;
+  bottom: calc(100% + 9px);
+  transform: translateX(-50%) translateY(4px);
+  z-index: 10050;
+  width: max-content;
+  max-width: 240px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #0f172a;
+  color: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+  text-align: center;
   white-space: normal;
-  box-shadow: var(--shadow-md);
+  box-shadow: 0 12px 28px rgba(2, 6, 23, 0.32);
+  opacity: 0;
+  visibility: hidden;
   pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.16s ease, visibility 0.16s;
+}
+[data-tooltip][data-tooltip-pos="bottom"]::after {
+  bottom: auto;
+  top: calc(100% + 9px);
+  transform: translateX(-50%) translateY(-4px);
+}
+[data-tooltip]:hover::after,
+[data-tooltip]:focus-visible::after,
+[data-tooltip].tooltip-open::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-tooltip]::after { transition: none; }
 }
 
 /* Focus visibility */
@@ -5999,6 +6363,12 @@ html { scroll-behavior: smooth; }
 .smart-review-toolbar label { font-size: 12px; font-weight: 700; color: var(--text-secondary); }
 .smart-review-toolbar select { max-width: 260px; padding: 7px 10px; font-size: 12px; }
 .smart-review-toolbar-note { font-size: 11px; color: var(--text-muted); }
+.diagram-style-subject {
+  display: inline-flex; align-items: center; padding: 4px 9px; border-radius: 999px;
+  background: var(--accent-light); color: var(--accent-primary);
+  font-size: 10.5px; font-weight: 800; letter-spacing: .02em;
+}
+.diagram-style-subject:empty { display: none; }
 .diagram-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .diagram-actions button { font-size: 11px; padding: 6px 9px; }
 .diagram-labels { font-size: 11px; color: var(--text-muted); line-height: 1.45; }
@@ -6120,13 +6490,125 @@ html { scroll-behavior: smooth; }
 .study-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); gap: 18px; }
 .study-panel { padding: 20px; }
 .study-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0 4px; }
-.study-chip { padding: 6px 10px; border: 1px solid var(--border-medium); border-radius: var(--radius-full); background: var(--white); font-size: 10.5px; font-weight: 600; color: var(--text-secondary); }
-.study-chip:hover, .study-chip.active { border-color: var(--accent-primary); background: var(--accent-light); color: var(--accent-primary); }
+.study-chip {
+  padding: 8px 14px; border: 1px solid var(--border-medium); border-radius: var(--radius-full);
+  background: var(--white); font-size: 11px; font-weight: 600; color: var(--text-secondary);
+  cursor: pointer; transition: all var(--transition-base); display: inline-flex; align-items: center; gap: 6px;
+}
+.study-chip:hover { border-color: var(--accent-primary); background: var(--white); color: var(--accent-primary); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+.study-chip.active { border-color: #0d9488; background: #0d9488; color: var(--white); box-shadow: 0 6px 16px rgba(13,148,136,0.28); transform: translateY(-1px); }
+.study-chip:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-light); }
+.study-chip-pro { display: inline-flex; align-items: center; gap: 3px; font-size: 8px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: #b45309; background: linear-gradient(135deg, #fef3c7, #f59e0b); border: 1px solid #f59e0b; padding: 2px 6px; border-radius: 6px; }
+.study-chip-pro svg { width: 9px; height: 9px; }
+.simple-mode-active #studyActions .study-chip[data-action="rewrite"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="translate"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="headings"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="organize"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="mcq"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="short_questions"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="long_questions"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="quiz"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="exam_topics"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="chapter_summary"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="explain"] { display: none; }
+.simple-mode-active #studyActions .study-chip[data-action="revision"] { display: none; }
+.simple-mode-active #studyPrompt { display: none; }
+.simple-mode-active .study-pro-tools { display: none; }
+
+/* ==== Study Pro Tools (Advanced mode only) ==== */
+.study-pro-tools {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(var(--glass-bg), var(--glass-bg)) padding-box,
+    linear-gradient(135deg, rgba(59,130,246,0.45), rgba(139,92,246,0.35)) border-box;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.06);
+  animation: studyFadeIn 0.4s ease;
+}
+.study-pro-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.study-pro-eyebrow { font-size: 9px; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; color: #6d28d9; background: linear-gradient(135deg, rgba(139,92,246,0.14), rgba(59,130,246,0.14)); border: 1px solid rgba(139,92,246,0.2); padding: 3px 8px; border-radius: 999px; }
+.study-pro-head p { margin: 0; font-size: 11px; color: var(--text-muted); }
+.study-pro-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.study-pro-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  background: var(--white);
+  text-align: left;
+  cursor: pointer;
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast), border-color var(--transition-fast);
+}
+.study-pro-card:hover { transform: translateY(-2px); border-color: rgba(139,92,246,0.45); box-shadow: 0 10px 24px rgba(109,40,217,0.12); }
+.study-pro-card.is-open { border-color: rgba(139,92,246,0.55); box-shadow: 0 0 0 3px rgba(139,92,246,0.10); }
+.study-pro-icon { width: 38px; height: 38px; flex: 0 0 38px; border-radius: 11px; display: grid; place-items: center; color: #6d28d9; background: linear-gradient(135deg, rgba(139,92,246,0.16), rgba(59,130,246,0.14)); border: 1px solid rgba(139,92,246,0.18); }
+.study-pro-icon svg { width: 19px; height: 19px; }
+.study-pro-copy { display: flex; flex-direction: column; min-width: 0; }
+.study-pro-copy strong { font-size: 12.5px; font-weight: 700; color: var(--text-primary); }
+.study-pro-copy small { font-size: 10.5px; color: var(--text-muted); }
+.study-pro-chevron { width: 15px; height: 15px; margin-left: auto; color: var(--text-muted); transition: transform var(--transition-base); }
+.study-pro-card.is-open .study-pro-chevron { transform: rotate(90deg); color: #6d28d9; }
+
+/* Chat with Notes */
+.chat-panel, .flashcard-panel { margin-top: 12px; padding: 14px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--white); box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }
+.chat-suggestions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.chat-suggestion { padding: 5px 10px; border-radius: 999px; border: 1px solid rgba(139,92,246,0.28); background: rgba(139,92,246,0.06); color: #6d28d9; font-size: 10.5px; font-weight: 600; cursor: pointer; transition: all var(--transition-fast); }
+.chat-suggestion:hover { background: rgba(139,92,246,0.14); border-color: rgba(139,92,246,0.5); }
+.chat-log { display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow-y: auto; padding: 4px; }
+.chat-empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 6px; padding: 22px 14px; color: var(--text-muted); }
+.chat-empty-icon { width: 30px; height: 30px; color: #8b5cf6; }
+.chat-empty strong { font-size: 12.5px; color: var(--text-secondary); }
+.chat-empty p { margin: 0; font-size: 11px; max-width: 340px; }
+.chat-msg { display: flex; }
+.chat-msg-user { justify-content: flex-end; }
+.chat-bubble { max-width: 88%; padding: 9px 12px; border-radius: 14px; font-size: 12px; line-height: 1.6; }
+.chat-msg-user .chat-bubble { background: linear-gradient(135deg, #2563eb, #7c3aed); color: #fff; border-bottom-right-radius: 4px; box-shadow: 0 6px 16px rgba(37,99,235,0.22); }
+.chat-msg-ai .chat-bubble { background: var(--surface-2); color: var(--text-primary); border-bottom-left-radius: 4px; border: 1px solid var(--border-light); }
+.chat-error { color: #b91c1c; font-weight: 600; }
+.chat-typing { display: inline-flex; gap: 4px; padding: 2px 0; }
+.chat-typing i { width: 5px; height: 5px; border-radius: 50%; background: #8b5cf6; animation: chatDot 1s ease-in-out infinite; }
+.chat-typing i:nth-child(2) { animation-delay: 0.15s; }
+.chat-typing i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes chatDot { 0%, 100% { opacity: 0.3; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-3px); } }
+.chat-compose { display: flex; gap: 8px; margin-top: 10px; }
+.chat-input { flex: 1; min-width: 0; padding: 10px 14px; border: 1px solid var(--border-medium); border-radius: 999px; font-size: 12px; background: var(--white); color: var(--text-primary); }
+.chat-input:focus { outline: none; border-color: #8b5cf6; box-shadow: 0 0 0 3px rgba(139,92,246,0.14); }
+.chat-hint, .fc-hint { margin: 8px 0 0; font-size: 10.5px; color: var(--text-muted); min-height: 14px; }
+
+/* Flashcard Mode — 3D flip cards */
+.fc-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.fc-progress { font-size: 11px; font-weight: 800; letter-spacing: 0.04em; color: var(--text-muted); }
+.fc-bar { height: 5px; margin: 10px 0 14px; border-radius: 999px; background: rgba(37,99,235,0.10); overflow: hidden; }
+.fc-bar span { display: block; height: 100%; width: 0; border-radius: inherit; background: linear-gradient(90deg, #3b82f6, #8b5cf6); transition: width 400ms ease; }
+.fc-stage { perspective: 1400px; }
+.fc-card { position: relative; width: 100%; min-height: 220px; transform-style: preserve-3d; transition: transform 0.65s cubic-bezier(0.22, 1, 0.36, 1); cursor: pointer; }
+.fc-card.flipped { transform: rotateY(180deg); }
+.fc-card:focus-visible { outline: none; }
+.fc-card:focus-visible .fc-face { box-shadow: 0 0 0 3px rgba(139,92,246,0.3); }
+.fc-face { position: absolute; inset: 0; backface-visibility: hidden; -webkit-backface-visibility: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 24px; border-radius: var(--radius-lg); text-align: center; }
+.fc-front { background: linear-gradient(160deg, #ffffff, #eef2ff); border: 1px solid rgba(59,130,246,0.22); box-shadow: 0 14px 32px rgba(15,23,42,0.10); }
+.fc-back { transform: rotateY(180deg); background: linear-gradient(160deg, #1e1b4b, #312e81); color: #fff; border: 1px solid rgba(139,92,246,0.4); box-shadow: 0 14px 32px rgba(49,46,129,0.30); }
+.fc-tag { font-size: 9px; font-weight: 800; letter-spacing: 0.16em; text-transform: uppercase; color: #2563eb; }
+.fc-back .fc-tag { color: #c4b5fd; }
+.fc-face p { margin: 0; font-size: 14px; font-weight: 600; line-height: 1.6; color: inherit; }
+.fc-face small { font-size: 10px; color: var(--text-muted); }
+.fc-back small { color: rgba(255,255,255,0.7); }
+.fc-controls { display: flex; gap: 8px; justify-content: center; margin-top: 14px; flex-wrap: wrap; }
+.btn-ico { width: 14px; height: 14px; vertical-align: -2px; }
+
+#studyActions { animation: studyFadeIn var(--transition-bounce, 0.45s) ease; }
+@keyframes studyFadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
 .study-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
 .study-fields label { display: block; font-size: 11px; font-weight: 700; color: var(--text-muted); margin-bottom: 5px; }
 .study-source, .study-notes { width: 100%; padding: 10px 12px; border: 1px solid var(--border-medium); border-radius: var(--radius-md); background: var(--white); font-size: 12px; }
 .study-notes { min-height: 150px; resize: vertical; line-height: 1.65; }
-.study-result { margin-top: 16px; padding: 16px; border: 1px solid var(--border-light); border-radius: var(--radius-lg); background: var(--surface-2); }
+.study-result { margin-top: 16px; padding: 18px; border: 1px solid var(--border-light); border-radius: var(--radius-lg); background: var(--glass-bg); backdrop-filter: var(--glass-blur); box-shadow: var(--shadow-md); animation: studyIn 0.35s var(--transition-bounce); }
+@keyframes studyIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 .study-result-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
 .study-result-text { white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; font-size: 12.5px; line-height: 1.7; color: var(--text-primary); margin: 0; }
 .study-saved { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
@@ -6180,6 +6662,96 @@ html { scroll-behavior: smooth; }
   border-color: var(--accent-primary);
   box-shadow: var(--shadow-premium);
 }
+
+/* Workspace plan card (dashboard) — premium typography & surfaces */
+#workspacePlanCard {
+  text-align: left;
+  padding: 24px;
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--elev-2), var(--depth-line);
+}
+#workspacePlanCard .plan-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+#workspacePlanCard .plan-title-wrap { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+#workspacePlanCard #planTitle { margin: 2px 0 0; font-size: 20px; font-weight: 800; letter-spacing: -0.02em; color: var(--text-primary); }
+#workspacePlanCard .plan-badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: var(--radius-full); font-size: 10px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: #1e3a8a; background: linear-gradient(135deg, #dbeafe, #bfdbfe); border: 1px solid rgba(30,58,138,0.18); box-shadow: 0 2px 6px rgba(30,58,138,0.12); }
+#workspacePlanCard #planDesc { margin: 8px 0 0; font-size: 13px; line-height: 1.6; color: var(--text-muted); }
+#workspacePlanCard .plan-stats { gap: 12px !important; }
+#workspacePlanCard .plan-stat { padding: 14px 10px; border-radius: var(--radius-lg); background: var(--glass-bg); border: 1px solid var(--glass-border); box-shadow: inset 0 1px 0 rgba(255,255,255,0.65), 0 2px 8px rgba(15,23,42,0.04); text-align: center; }
+#workspacePlanCard .plan-stat-value { font-size: 15px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.3; color: var(--text-primary); }
+#workspacePlanCard .plan-stat-label { margin-top: 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); }
+#workspacePlanCard .plan-bar {
+  position: relative;
+  height: 6px;
+  width: 100%;
+  max-width: 150px;
+  margin: 9px auto 2px;
+  border-radius: 999px;
+  background: rgba(37,99,235,0.10);
+  overflow: hidden;
+  box-shadow: inset 0 1px 2px rgba(15,23,42,0.08);
+}
+#workspacePlanCard .plan-bar > span {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+  box-shadow: 0 0 8px rgba(59,130,246,0.45);
+  transition: width 700ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+#workspacePlanCard .plan-bar.is-warn > span { background: linear-gradient(90deg, #f59e0b, #ef4444); box-shadow: 0 0 8px rgba(245,158,11,0.45); }
+#workspacePlanCard .plan-bar.is-full > span { background: linear-gradient(90deg, #ef4444, #b91c1c); box-shadow: 0 0 8px rgba(239,68,68,0.45); }
+@media (max-width: 640px) {
+  #workspacePlanCard .plan-stats { grid-template-columns: 1fr !important; }
+}
+
+/* ==== Search Page ==== */
+.search-hero { margin: 4px 0 18px; }
+.search-input-wrap { position: relative; display: flex; align-items: center; }
+.search-input-icon { position: absolute; left: 18px; font-size: 16px; color: var(--text-muted); pointer-events: none; display: inline-flex; }
+.search-input-icon svg { width: 16px; height: 16px; }
+.processing-orb svg { width: 22px; height: 22px; }
+.search-input { width: 100%; padding: 16px 18px 16px 48px; border-radius: var(--radius-full); border: 1px solid var(--border-medium); background: var(--white); color: var(--text-primary); font-size: 15px; font-weight: 500; outline: none; box-shadow: var(--shadow-sm); transition: border-color var(--transition-base), box-shadow var(--transition-base); }
+.search-input:focus { border-color: var(--accent-primary); box-shadow: 0 0 0 4px var(--accent-light), var(--shadow-md); }
+.search-results { margin-top: 6px; }
+.search-result-list { display: flex; flex-direction: column; gap: 8px; }
+.search-result { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--border-light); border-radius: var(--radius-lg); background: var(--white); text-decoration: none; color: var(--text-primary); box-shadow: 0 2px 8px rgba(15,23,42,0.04); transition: transform var(--transition-fast), box-shadow var(--transition-fast), border-color var(--transition-fast); }
+.search-result:hover { transform: translateY(-2px); border-color: var(--accent-primary); box-shadow: var(--shadow-md); }
+.search-result-icon { width: 36px; height: 36px; border-radius: var(--radius-md); display: grid; place-items: center; background: var(--accent-light); color: var(--accent-primary); flex-shrink: 0; }
+.search-result-body { display: flex; flex-direction: column; min-width: 0; }
+.search-result-body strong { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-result-body small { font-size: 11px; color: var(--text-muted); }
+.search-result-arrow { margin-left: auto; color: var(--text-muted); }
+/* ==== Subscription Page ==== */
+.plan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+@media (max-width: 640px) { .plan-grid { grid-template-columns: 1fr; } }
+.plan-action-status { margin: 12px 2px 0; font-size: 12px; font-weight: 600; color: var(--accent-primary); min-height: 16px; }
+
+/* ==== Help & Support ==== */
+.help-layout { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.85fr); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .help-layout { grid-template-columns: 1fr; } }
+.help-faq .panel-header, .help-contact .panel-header { margin-bottom: 14px; }
+.faq-list { display: flex; flex-direction: column; gap: 8px; }
+.faq-item { border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--white); box-shadow: 0 2px 8px rgba(15,23,42,0.04); transition: border-color var(--transition-fast), box-shadow var(--transition-fast); }
+.faq-item:hover { border-color: rgba(59,130,246,0.35); box-shadow: 0 8px 20px rgba(37,99,235,0.08); }
+.faq-item[open] { border-color: rgba(139,92,246,0.4); box-shadow: 0 10px 24px rgba(109,40,217,0.08); }
+.faq-item summary { list-style: none; cursor: pointer; padding: 13px 16px; font-size: 13px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.faq-item summary::-webkit-details-marker { display: none; }
+.faq-item summary::after { content: '+'; font-size: 18px; font-weight: 400; color: #6d28d9; transition: transform var(--transition-base); }
+.faq-item[open] summary::after { transform: rotate(45deg); }
+.faq-answer { padding: 0 16px 14px; }
+.faq-answer p { margin: 0; font-size: 12.5px; line-height: 1.7; color: var(--text-muted); }
+.help-contact-row { display: flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--white); text-decoration: none; color: var(--text-primary); margin-bottom: 8px; transition: transform var(--transition-fast), box-shadow var(--transition-fast), border-color var(--transition-fast); }
+a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,92,246,0.4); box-shadow: 0 10px 24px rgba(109,40,217,0.10); }
+.help-contact-row.is-static { cursor: default; }
+.help-contact-icon { width: 38px; height: 38px; flex: 0 0 38px; border-radius: 11px; display: grid; place-items: center; color: #2563eb; background: linear-gradient(135deg, rgba(59,130,246,0.14), rgba(139,92,246,0.12)); border: 1px solid rgba(59,130,246,0.16); }
+.help-contact-icon svg { width: 18px; height: 18px; }
+.help-contact-copy { display: flex; flex-direction: column; min-width: 0; }
+.help-contact-copy strong { font-size: 12.5px; font-weight: 700; }
+.help-contact-copy small { font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }
+.help-contact-arrow { width: 15px; height: 15px; margin-left: auto; color: var(--text-muted); }
+.help-copy-btn { width: 100%; margin-top: 6px; }
+.help-note { margin: 12px 0 0; font-size: 10.5px; line-height: 1.6; color: var(--text-muted); }
 .plan-card .plan-name {
   font-size: 18px;
   font-weight: 700;
@@ -6295,7 +6867,6 @@ html { scroll-behavior: smooth; }
   .pdf-studio .studio-grid { grid-template-columns: 1fr; }
   .study-panel { padding: 15px; }
 }
-}
 /* --- Animated Download Button (ab-13) --- */
 .ab-13 { display: inline-flex; flex-direction: column; align-items: center; gap: 6px; }
 .ab-13__label { font-size: 11px; color: var(--text-muted); margin: 0; }
@@ -6351,6 +6922,33 @@ html { scroll-behavior: smooth; }
   <symbol id="icon-admin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4.5 6v5.5c0 4.6 3.2 8 7.5 9.5 4.3-1.5 7.5-4.9 7.5-9.5V6z"/><path d="m9 12 2 2 4-4"/></symbol>
   <symbol id="icon-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></symbol>
   <symbol id="icon-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+  <symbol id="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7"/></symbol>
+  <symbol id="icon-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 4.1 2.2 18a2 2 0 0 0 1.7 3h16.2a2 2 0 0 0 1.7-3L13.7 4.1a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="icon-storage" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></symbol>
+  <symbol id="icon-cloud" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a4.5 4.5 0 0 1-.7-8.9A6 6 0 0 1 18 9.5a3.8 3.8 0 0 1 .4 7.5"/><path d="M12 21v-7"/><path d="m9 16.5 3-3 3 3"/></symbol>
+  <symbol id="icon-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H8l-4.5 2.5V14A8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5Z"/><path d="M8 9.5h8"/><path d="M8 13.5h5"/></symbol>
+  <symbol id="icon-cards" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="12" height="14" rx="2"/><path d="M8 3.5h10A2.5 2.5 0 0 1 20.5 6v10"/><path d="M7 12h4"/><path d="M7 16h3"/></symbol>
+  <symbol id="icon-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 14 9l6.5 2-6.5 2-2 6.5-2-6.5L3.5 11 10 9Z"/><path d="M19 3.5v3M17.5 5h3"/></symbol>
+  <symbol id="icon-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></symbol>
+  <symbol id="icon-star" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1L3.2 9.5l6.1-.9Z"/></symbol>
+  <symbol id="icon-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 9a6 6 0 1 0-12 0c0 5-2 6-2 6h16s-2-1-2-6"/><path d="M10.5 20a2 2 0 0 0 3 0"/></symbol>
+  <symbol id="icon-logout" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
+  <symbol id="icon-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="icon-mail" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3.5 7 8.5 6 8.5-6"/></symbol>
+  <symbol id="icon-arrow-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></symbol>
+  <symbol id="icon-help" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.4 9a2.6 2.6 0 1 1 4.2 2.1c-1 .7-1.6 1.3-1.6 2.4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="icon-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 20h16"/></symbol>
+  <symbol id="icon-image" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="m21 16-5-5L5 20"/></symbol>
+  <symbol id="icon-empty-docs" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 10h20l8 8v30a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4V14a4 4 0 0 1 4-4Z" fill="none"/>
+    <path d="M38 10v8h8"/><path d="M22 27h16M22 34h16M22 41h10"/>
+    <path d="m44 47 3 3 6-7" stroke="#16a34a"/>
+  </symbol>
+  <symbol id="icon-empty-activity" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="32" cy="32" r="20" fill="none"/><path d="M32 20v12l8 5"/>
+    <path d="M32 8v4M32 52v4M8 32h4M52 32h4"/>
+    <circle cx="50" cy="19" r="4" fill="none"/><path d="M47 19h6M50 16v6" stroke="#16a34a"/>
+  </symbol>
 </svg>
 
 <!-- Skip link for keyboard and screen-reader users -->
@@ -6371,16 +6969,17 @@ html { scroll-behavior: smooth; }
     <div class="logo" aria-hidden="true">N</div>
     <div class="brand-copy">
       <strong>NotesAI</strong>
-      <small>Premium Workspace</small>
+      <small>Study Smarter</small>
     </div>
   </div>
 
   <div class="nav-label">Workspace</div>
   <nav class="nav">
+    <a class="{% if page == 'home' %}active{% endif %}" href="/home" data-page="home" aria-label="Home" title="Home"{% if page == 'home' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-home"></use></svg><span class="nav-text">Home</span></a>
     <a class="{% if page == 'dashboard' %}active{% endif %}" href="/" data-page="dashboard" aria-label="Dashboard" title="Dashboard"{% if page == 'dashboard' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-home"></use></svg><span class="nav-text">Dashboard</span></a>
     <a class="{% if page == 'study' %}active{% endif %}" href="/study" data-page="study" aria-label="AI Study" title="AI Study"{% if page == 'study' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-study"></use></svg><span class="nav-text">AI Study</span></a>
     <a class="{% if page == 'my-notes' %}active{% endif %}" href="/my-notes" data-page="my-notes" aria-label="My Notes" title="My Notes"{% if page == 'my-notes' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-notes"></use></svg><span class="nav-text">My Notes</span></a>
-    <a class="{% if page == 'new-order' %}active{% endif %}" href="/new-order" data-page="new-order" aria-label="PDF Studio" title="PDF Studio"{% if page == 'new-order' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-upload"></use></svg><span class="nav-text">PDF Studio</span></a>
+    <a class="{% if page == 'new-order' %}active{% endif %}" href="/new-order" data-page="new-order" aria-label="PDF Studio" title="PDF Studio"{% if page == 'new-order' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-upload"></use></svg><span class="nav-text">PDF Studio</span><span style="background: #ef4444; color: white; font-size: 9px; padding: 2px 6px; border-radius: 8px; margin-left: auto;">New</span></a>
     <a class="{% if page == 'history' %}active{% endif %}" href="/history" data-page="history" aria-label="History" title="History"{% if page == 'history' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-history"></use></svg><span class="nav-text">History</span></a>
   </nav>
 
@@ -6388,34 +6987,159 @@ html { scroll-behavior: smooth; }
   <nav class="nav">
     <a class="{% if page == 'admin' %}active{% endif %}" href="/admin" data-page="admin" aria-label="Admin" title="Admin"{% if page == 'admin' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-admin"></use></svg><span class="nav-text">Admin</span></a>
     <a class="{% if page == 'settings' %}active{% endif %}" href="/settings" data-page="settings" aria-label="Settings" title="Settings"{% if page == 'settings' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-settings"></use></svg><span class="nav-text">Settings</span></a>
+    <a class="{% if page == 'search' %}active{% endif %}" href="/search" data-page="search" aria-label="Search" title="Search"{% if page == 'search' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-menu"></use></svg><span class="nav-text">Search</span></a>
+    <a class="{% if page == 'trash' %}active{% endif %}" href="/trash" data-page="trash" aria-label="Trash" title="Trash"{% if page == 'trash' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-notes"></use></svg><span class="nav-text">Trash</span></a>
+    <a class="{% if page == 'subscription' %}active{% endif %}" href="/subscription" data-page="subscription" aria-label="Subscription" title="Subscription"{% if page == 'subscription' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-settings"></use></svg><span class="nav-text">Subscription</span></a>
+    <a class="{% if page == 'help' %}active{% endif %}" href="/help" data-page="help" aria-label="Help" title="Help"{% if page == 'help' %} aria-current="page"{% endif %}><svg class="nav-icon" aria-hidden="true" focusable="false"><use href="#icon-home"></use></svg><span class="nav-text">Help</span></a>
   </nav>
 
-  <div class="side-bottom">
-    <span class="premium-badge"><span aria-hidden="true">✦</span> Premium Workspace</span>
-    <p>Transform handwritten notes into polished digital documents with AI precision.</p>
+    <div class="sidebar-user-card" style="background: var(--royal-blue); color: white; padding: 12px 14px; border-radius: var(--radius-lg); margin-bottom: 12px; display: flex; align-items: center; gap: 10px;">
+    <div class="user-avatar" style="width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, #fbbf24, #f59e0b); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; color: #1e3a8a;">{{ user_initial }}</div>
+    <div>
+      <strong style="display: block; font-size: 13px;">Lucky 59</strong>
+      <small style="display: block; font-size: 11px; opacity: 0.8;">Dream Big...</small>
+    </div>
   </div>
+  
 </aside>
 
 <!-- Main Content -->
 <main class="main" id="mainContent" role="main">
-  {% if page == 'dashboard' %}
-  <!-- Dashboard Header -->
+  {% if page in ['dashboard', 'home'] %}
+  <!-- Top Navigation Bar -->
   <header class="topbar" role="banner">
     <div class="topbar-left">
-      <div class="eyebrow">PREMIUM WORKSPACE</div>
-      <h1>Dashboard</h1>
+      <div class="logo">N</div>
+      <div class="brand-copy">
+        <strong>NotesAI</strong>
+        <small>Study Smarter</small>
+      </div>
     </div>
-    <div class="avatar" aria-hidden="true">N</div>
+    <div class="topbar-center">
+      <div class="topbar-search">
+        <span class="topbar-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg></span>
+        <input type="text" id="topbarSearchInput" placeholder="Search your documents..." autocomplete="off" />
+      </div>
+    </div>
+    <div class="topbar-right">
+      <a href="/subscription" class="btn-premium"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-star"></use></svg> Premium</a>
+      <div class="topbar-menu-wrap">
+        <button class="btn-notification" id="notifBtn" type="button" aria-label="Notifications" aria-expanded="false" aria-haspopup="menu" data-tooltip="Workspace notifications" data-tooltip-pos="bottom">
+          <span class="notif-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-bell"></use></svg></span>
+          <span class="notif-dot" id="notifDot" hidden></span>
+        </button>
+        <div class="topbar-menu topbar-menu-notif dropdown-menu" id="notifMenu" role="menu" aria-hidden="true">
+          <div class="topbar-menu-header">
+            <span>Notifications</span>
+            <span class="notif-count" id="notifCount" hidden>0</span>
+          </div>
+          <div class="notif-list" id="notifList" aria-live="polite">
+            <div class="notif-empty">
+              <span class="notif-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-check"></use></svg></span>
+              <strong>You're all caught up!</strong>
+              <p>We'll notify you when your PDFs are ready.</p>
+            </div>
+          </div>
+          <div class="topbar-menu-sep"></div>
+          <div class="notif-footer">
+            <button class="notif-mark-read" id="notifMarkRead" type="button" disabled>Mark all as read</button>
+            <a class="notif-view-all" href="/history">View history</a>
+          </div>
+        </div>
+      </div>
+      <div class="topbar-avatar-wrap">
+        <div class="avatar" id="userAvatar" data-tooltip="Account and settings" data-tooltip-pos="bottom">{{ user_initial }}</div>
+        <div class="topbar-menu topbar-menu-account dropdown-menu" id="accountMenu" role="menu" aria-hidden="true">
+          <div class="topbar-menu-header">{{ user_name }}</div>
+          <a class="topbar-menu-item" href="/settings"><div class="topbar-menu-icon"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-settings"></use></svg></div><div class="topbar-menu-text"><strong>Settings</strong><p>Workspace preferences</p></div></a>
+          <a class="topbar-menu-item" href="/subscription"><div class="topbar-menu-icon"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-star"></use></svg></div><div class="topbar-menu-text"><strong>Premium</strong><p>Upgrade plan</p></div></a>
+          <div class="topbar-menu-sep"></div>
+          <button class="topbar-menu-item topbar-menu-logout" id="topbarLogoutBtn" type="button"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-logout"></use></svg> Logout</button>
+        </div>
+      </div>
+    </div>
   </header>
 
   <!-- Welcome Hero -->
   <section class="welcome hero" aria-labelledby="welcome-title">
     <div class="hero-glow" aria-hidden="true"></div>
     <div class="welcome-content">
-      <h2 id="welcome-title">Ideas, refined. <span>Effortlessly.</span></h2>
-      <p>Transform handwritten notes into polished digital documents with AI-powered precision.</p>
+      <h2 id="welcome-title">Welcome back, {{ user_name }}! <span class="wave-emoji">👋</span></h2>
+      <p>Create, study and organize your notes with NotesAI.</p>
+      <a class="btn-3d btn-primary welcome-action" href="/new-order"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-plus"></use></svg> Create New Order</a>
     </div>
-    <a class="btn-3d btn-primary welcome-action" href="/new-order"><span aria-hidden="true">＋</span> Create New Order</a>
+    <div class="welcome-illustration" aria-hidden="true">
+      <div class="illustration-inner">
+        <svg class="open-book-art" viewBox="0 0 220 170" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Open book illustration">
+          <defs>
+            <radialGradient id="bookShadow" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="#0f172a" stop-opacity="0.32"/>
+              <stop offset="100%" stop-color="#0f172a" stop-opacity="0"/>
+            </radialGradient>
+            <linearGradient id="coverLeft" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#1e40af"/><stop offset="55%" stop-color="#1e3a8a"/><stop offset="100%" stop-color="#0f172a"/>
+            </linearGradient>
+            <linearGradient id="coverRight" x1="1" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#1e40af"/><stop offset="55%" stop-color="#1e3a8a"/><stop offset="100%" stop-color="#0f172a"/>
+            </linearGradient>
+            <linearGradient id="pageLeft" x1="0" y1="0" x2="0.9" y2="1">
+              <stop offset="0%" stop-color="#ffffff"/><stop offset="55%" stop-color="#f8fafc"/><stop offset="100%" stop-color="#e2e8f0"/>
+            </linearGradient>
+            <linearGradient id="pageRight" x1="1" y1="0" x2="0.1" y2="1">
+              <stop offset="0%" stop-color="#ffffff"/><stop offset="55%" stop-color="#f8fafc"/><stop offset="100%" stop-color="#e2e8f0"/>
+            </linearGradient>
+            <linearGradient id="ribbonGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#fb7185"/><stop offset="100%" stop-color="#be123c"/>
+            </linearGradient>
+            <linearGradient id="pageSheen" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#ffffff" stop-opacity="0.75"/><stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+            </linearGradient>
+            <filter id="softBlur" x="-30%" y="-60%" width="160%" height="220%"><feGaussianBlur stdDeviation="7"/></filter>
+            <filter id="bookDrop" x="-20%" y="-20%" width="140%" height="150%">
+              <feDropShadow dx="0" dy="10" stdDeviation="6" flood-color="#0f172a" flood-opacity="0.28"/>
+            </filter>
+          </defs>
+
+          <ellipse cx="110" cy="151" rx="86" ry="12" fill="url(#bookShadow)" filter="url(#softBlur)"/>
+
+          <g filter="url(#bookDrop)">
+            <path d="M110 40 C82 26 46 28 14 43 L14 138 C46 123 82 121 110 135 Z" fill="url(#coverLeft)"/>
+            <path d="M110 40 C138 26 174 28 206 43 L206 138 C174 123 138 121 110 135 Z" fill="url(#coverRight)"/>
+            <path d="M110 46 C82 33 48 35 18 49 L18 133 C50 119 82 117 110 130 Z" fill="#cbd5e1"/>
+            <path d="M110 46 C138 33 172 35 202 49 L202 133 C170 119 138 117 110 130 Z" fill="#cbd5e1"/>
+            <path d="M110 44 C82 31 48 33 20 47 L20 131 C50 117 82 115 110 128 Z" fill="#e2e8f0"/>
+            <path d="M110 44 C138 31 172 33 200 47 L200 131 C170 117 138 115 110 128 Z" fill="#e2e8f0"/>
+            <path d="M110 42 C82 29 46 31 18 45 L18 129 C48 115 82 113 110 126 Z" fill="url(#pageLeft)" stroke="#cbd5e1" stroke-width="0.8"/>
+            <path d="M110 42 C138 29 174 31 202 45 L202 129 C172 115 138 113 110 126 Z" fill="url(#pageRight)" stroke="#cbd5e1" stroke-width="0.8"/>
+            <path d="M110 42 C105 44 105 124 110 126 Z" fill="#0f172a" opacity="0.10"/>
+            <path d="M110 42 C115 44 115 124 110 126 Z" fill="#0f172a" opacity="0.06"/>
+            <path d="M110 42 L110 126" stroke="#94a3b8" stroke-width="1.1" opacity="0.55"/>
+            <g fill="none" stroke="#94a3b8" stroke-linecap="round" opacity="0.42">
+              <path d="M30 58 C54 49 82 47 102 55" stroke-width="1.6"/>
+              <path d="M28 72 C52 63 80 61 102 69" stroke-width="1.5"/>
+              <path d="M26 86 C50 77 78 75 102 83" stroke-width="1.5"/>
+              <path d="M28 100 C50 92 76 90 100 97" stroke-width="1.4"/>
+              <path d="M32 114 C52 107 76 105 96 111" stroke-width="1.2"/>
+            </g>
+            <g fill="none" stroke="#94a3b8" stroke-linecap="round" opacity="0.42">
+              <path d="M118 55 C138 47 166 49 190 58" stroke-width="1.6"/>
+              <path d="M118 69 C140 61 168 63 192 72" stroke-width="1.5"/>
+              <path d="M118 83 C140 75 168 77 192 86" stroke-width="1.5"/>
+              <path d="M120 97 C142 90 166 92 190 100" stroke-width="1.4"/>
+              <path d="M124 111 C144 105 166 107 186 114" stroke-width="1.2"/>
+            </g>
+            <path d="M128 40 L146 40 L146 98 L137 90 L128 98 Z" fill="url(#ribbonGrad)"/>
+            <path d="M128 40 L146 40 L146 47 L128 47 Z" fill="#be123c" opacity="0.35"/>
+            <path d="M110 42 C82 29 46 31 18 45 L18 68 C48 54 82 52 110 65 Z" fill="url(#pageSheen)" opacity="0.55"/>
+            <path d="M110 42 C138 29 174 31 202 45 L202 58 C172 47 138 45 110 55 Z" fill="url(#pageSheen)" opacity="0.35"/>
+          </g>
+          <g fill="#60a5fa" opacity="0.85">
+            <path d="M196 26 l2.2 5.4 5.4 2.2 -5.4 2.2 -2.2 5.4 -2.2 -5.4 -5.4 -2.2 5.4 -2.2 Z"/>
+            <path d="M28 20 l1.6 3.8 3.8 1.6 -3.8 1.6 -1.6 3.8 -1.6 -3.8 -3.8 -1.6 3.8 -1.6 Z" opacity="0.7"/>
+          </g>
+        </svg>
+      </div>
+    </div>
   </section>
 
   <!-- Statistics -->
@@ -6423,7 +7147,7 @@ html { scroll-behavior: smooth; }
     <article class="stat-card">
       <div class="stat-header">
         <span class="stat-label">Stored Documents</span>
-        <span class="stat-icon" aria-hidden="true">▤</span>
+        <span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-notes"></use></svg></span>
       </div>
       <div class="stat-value" id="statTotal">—</div>
       <p class="stat-desc">Active files in this workspace</p>
@@ -6431,7 +7155,7 @@ html { scroll-behavior: smooth; }
     <article class="stat-card">
       <div class="stat-header">
         <span class="stat-label">In Progress</span>
-        <span class="stat-icon" aria-hidden="true">◷</span>
+        <span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-history"></use></svg></span>
       </div>
       <div class="stat-value" id="statProgress">—</div>
       <p class="stat-desc">Orders being processed</p>
@@ -6439,7 +7163,7 @@ html { scroll-behavior: smooth; }
     <article class="stat-card">
       <div class="stat-header">
         <span class="stat-label">Completed</span>
-        <span class="stat-icon" aria-hidden="true">✓</span>
+        <span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-check"></use></svg></span>
       </div>
       <div class="stat-value" id="statCompleted">—</div>
       <p class="stat-desc">All-time completed jobs</p>
@@ -6447,7 +7171,7 @@ html { scroll-behavior: smooth; }
     <article class="stat-card">
       <div class="stat-header">
         <span class="stat-label">Failed Jobs</span>
-        <span class="stat-icon" aria-hidden="true">!</span>
+        <span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-alert"></use></svg></span>
       </div>
       <div class="stat-value" id="statFailed">—</div>
       <p class="stat-desc">All-time failed jobs</p>
@@ -6455,23 +7179,15 @@ html { scroll-behavior: smooth; }
     <article class="stat-card">
       <div class="stat-header">
         <span class="stat-label">Storage Used</span>
-        <span class="stat-icon" aria-hidden="true">◫</span>
+        <span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-storage"></use></svg></span>
       </div>
       <div class="stat-value" id="statStorage">—</div>
       <p class="stat-desc">Local PDF workspace</p>
     </article>
-    <article class="stat-card">
-      <div class="stat-header">
-        <span class="stat-label">Workspace Plan</span>
-        <span class="stat-icon" aria-hidden="true">✦</span>
-      </div>
-      <div class="stat-value" id="statPlan" style="font-size:22px;">—</div>
-      <p class="stat-desc" id="statPlanDesc">Loading plan…</p>
-    </article>
   </section>
 
   <!-- Workspace Plan -->
-  <article class="panel plan-card depth-3 sheen">
+  <article class="panel plan-card depth-3 sheen" id="workspacePlanCard">
     <div class="plan-head">
       <div class="panel-eyebrow">WORKSPACE PLAN</div>
       <div class="plan-title-wrap">
@@ -6483,10 +7199,12 @@ html { scroll-behavior: smooth; }
     <div class="plan-stats" id="planStats" style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px;">
       <div class="plan-stat">
         <div class="plan-stat-value" id="planMaxDocs">—</div>
+        <div class="plan-bar" role="progressbar" aria-label="Document usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="planDocsBar"></span></div>
         <div class="plan-stat-label">Max documents</div>
       </div>
       <div class="plan-stat">
         <div class="plan-stat-value" id="planStorage">—</div>
+        <div class="plan-bar" role="progressbar" aria-label="Storage usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="planStorageBar"></span></div>
         <div class="plan-stat-label">Storage</div>
       </div>
       <div class="plan-stat">
@@ -6495,7 +7213,7 @@ html { scroll-behavior: smooth; }
       </div>
     </div>
     <div class="plan-actions" style="display:flex; gap:8px; margin-top: 14px; flex-wrap:wrap;">
-      <a class="btn-3d btn-secondary" href="/settings"><span aria-hidden="true">⚙</span> Manage Workspace</a>
+      <a class="btn-3d btn-secondary" href="/settings"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-settings"></use></svg> Manage Workspace</a>
     </div>
   </article>
 
@@ -6507,10 +7225,8 @@ html { scroll-behavior: smooth; }
       </div>
       <p>Jump straight into the workspace.</p>
       <div class="quick-actions">
-        <a class="quick-action" href="/new-order"><span aria-hidden="true">✦</span> Create a PDF</a>
-        <a class="quick-action" href="/study"><span aria-hidden="true">✧</span> Study with AI</a>
-        <a class="quick-action" href="/my-notes"><span aria-hidden="true">▤</span> My documents</a>
-        <a class="quick-action" href="/admin"><span aria-hidden="true">◈</span> Admin overview</a>
+        <a class="quick-action" href="/my-notes"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-notes"></use></svg> My documents</a>
+        <a class="quick-action" href="/admin"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-admin"></use></svg> Admin overview</a>
       </div>
     </article>
     <article class="panel dashboard-card depth-2 sheen">
@@ -6520,7 +7236,12 @@ html { scroll-behavior: smooth; }
       </div>
       <p>Your newest generated files.</p>
       <div class="recent-mini-list" id="dashboardRecent">
-        <div class="empty-state" style="padding:16px;"><p>No documents yet.</p></div>
+        <div class="empty-state compact">
+          <div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 64 64"><use href="#icon-empty-docs"></use></svg></div>
+          <h4>No documents yet</h4>
+          <p>Generate your first PDF to see it here.</p>
+          <a class="btn-3d btn-primary" href="/new-order">Create your first document</a>
+        </div>
       </div>
     </article>
     <article class="panel dashboard-card depth-2 sheen">
@@ -6530,7 +7251,12 @@ html { scroll-behavior: smooth; }
       </div>
       <p>Your latest document actions.</p>
       <div class="activity-timeline" id="dashboardActivity">
-        <div class="empty-state" style="padding:12px 16px;"><p>No recent activity.</p></div>
+        <div class="empty-state compact">
+          <div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 64 64"><use href="#icon-empty-activity"></use></svg></div>
+          <h4>No recent activity</h4>
+          <p>Your document actions will appear here.</p>
+          <a class="btn-3d btn-primary" href="/new-order">Create your first document</a>
+        </div>
       </div>
     </article>
   </div>
@@ -6564,7 +7290,7 @@ html { scroll-behavior: smooth; }
         <input type="hidden" id="jobId" name="jobId" value="">
         <!-- Dropzone -->
         <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="Upload files: drag and drop, or press Enter to choose files">
-          <div class="dropzone-icon" aria-hidden="true">✧</div>
+          <div class="dropzone-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-cloud"></use></svg></div>
           <strong>Your document starts here</strong>
           <p>JPG, PNG, WEBP, BMP or PDF · Maximum 20 MB</p>
           <button type="button" class="btn-outline" onclick="document.getElementById('noteFile').click()">Choose Files</button>
@@ -6632,7 +7358,7 @@ html { scroll-behavior: smooth; }
         <!-- PDF Studio — organized, beginner-friendly settings -->
         <details class="pdf-studio" open>
           <summary class="studio-summary" role="button" aria-expanded="true">
-            <span aria-hidden="true">✎</span> PDF Studio — design your PDF
+            <svg class="btn-ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-notes"></use></svg> PDF Studio — design your PDF
           </summary>
           <p class="studio-intro">These controls change how your PDF looks. Your original extracted content is never removed or rewritten.</p>
 
@@ -6799,7 +7525,7 @@ html { scroll-behavior: smooth; }
         <!-- Extract Actions -->
         <div class="extract-actions">
           <button type="button" class="btn-3d btn-secondary" id="extractBtn" style="width: 100%;" data-tooltip="Read the selected files with the active AI provider">
-            <span aria-hidden="true">✧</span> Extract Text with AI
+            <svg class="btn-ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-spark"></use></svg> Extract Text with AI
           </button>
           <p id="providerHint" style="margin-top:8px;font-size:12px;color:var(--text-muted);"></p>
         </div>
@@ -6807,7 +7533,7 @@ html { scroll-behavior: smooth; }
         <!-- AI Processing Steps -->
         <div class="processing-card" id="aiProcessing" hidden aria-busy="true">
           <div class="processing-head">
-            <div class="processing-orb" aria-hidden="true" data-icon="✦">✦</div>
+            <div class="processing-orb" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-spark"></use></svg></div>
             <div class="processing-copy">
               <div class="processing-title" id="aiProcessingTitle">AI is working</div>
               <div class="processing-subtitle" id="aiProcessingSubtitle" role="status" aria-live="polite" aria-atomic="true">Please keep this page open.</div>
@@ -6862,10 +7588,11 @@ html { scroll-behavior: smooth; }
             <p>Check extracted structure, tables, diagram labels and placement before generating the premium PDF. Unclear diagrams can be kept as the original crop.</p>
             <div class="smart-review-toolbar">
               <label for="diagramStyle">Diagram appearance</label>
-              <select class="form-select" id="diagramStyle">
+              <select class="form-select" id="diagramStyle" data-tooltip="Choose how recreated diagrams are drawn">
                 <option value="color">Color Digital Diagram</option>
                 <option value="pencil">Pencil Sketch Diagram</option>
               </select>
+              <span class="diagram-style-subject" id="diagramStyleSubject" aria-live="polite"></span>
               <span class="smart-review-toolbar-note">Applies to recreated diagrams only. Original crops stay unchanged.</span>
             </div>
           </div>
@@ -6875,7 +7602,7 @@ html { scroll-behavior: smooth; }
         <!-- Generate Actions -->
         <div class="upload-actions">
           <button type="submit" class="btn-3d btn-primary" id="generateBtn" style="width: 100%;" data-tooltip="Generate the final PDF and save it to My Notes">
-            <span aria-hidden="true">⟳</span> Generate & Download PDF
+            <svg class="btn-ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-spark"></use></svg> Generate &amp; Download PDF
           </button>
           <p id="uploadStatus" role="status" aria-live="polite"></p>
         </div>
@@ -6883,7 +7610,7 @@ html { scroll-behavior: smooth; }
         <!-- PDF Processing Steps -->
         <div class="processing-card" id="pdfProcessing" hidden aria-busy="true">
           <div class="processing-head">
-            <div class="processing-orb" aria-hidden="true" data-icon="◈">◈</div>
+            <div class="processing-orb" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-spark"></use></svg></div>
             <div class="processing-copy">
               <div class="processing-title" id="pdfProcessingTitle">Preparing your document</div>
               <div class="processing-subtitle" id="pdfProcessingSubtitle" role="status" aria-live="polite" aria-atomic="true">Building a print-ready PDF.</div>
@@ -6907,12 +7634,21 @@ html { scroll-behavior: smooth; }
     {% endif %}
 
     {% if page == 'study' %}
-    <article class="panel study-panel" id="studyPanel">
+    <article class="panel study-panel simple-mode-active" id="studyPanel">
       <div class="panel-header">
         <div class="panel-eyebrow">AI STUDY WORKSPACE</div>
         <h3>Turn notes into study material</h3>
         <p>Use a saved document or paste notes. Generate summaries, questions, flashcards, quizzes and revision sheets with the active provider.</p>
       </div>
+    <!-- Mode Toggle -->
+    <div style="margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid var(--border-medium);">
+      <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+        <button id="modeSimple" class="study-chip active" style="flex: 1;" data-mode="simple">Simple</button>
+        <button id="modeAdvanced" class="study-chip" style="flex: 1;" data-mode="advanced">Advanced</button>
+      </div>
+      <small id="studyModeHint" style="margin-top: 6px; color: var(--text-muted); font-size: 11px;">Simple: 4 actions | Advanced: 15 actions + diagrams</small>
+    </div>
+    
       <div class="study-actions" id="studyActions" role="group" aria-label="Study actions">
         <button type="button" class="study-chip active" data-action="summarize">Summarize</button>
         <button type="button" class="study-chip" data-action="key_points">Key points</button>
@@ -6925,10 +7661,10 @@ html { scroll-behavior: smooth; }
         <button type="button" class="study-chip" data-action="long_questions">Long questions</button>
         <button type="button" class="study-chip" data-action="flashcards">Flashcards</button>
         <button type="button" class="study-chip" data-action="quiz">Quiz</button>
-        <button type="button" class="study-chip" data-action="exam_topics">Exam topics</button>
+        <button type="button" class="study-chip" data-action="exam_topics">Exam topics <span class="study-chip-pro"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-spark"></use></svg> PRO</span></button>
         <button type="button" class="study-chip" data-action="chapter_summary">Chapter summary</button>
         <button type="button" class="study-chip" data-action="explain">Explain simply</button>
-        <button type="button" class="study-chip" data-action="revision">Revision sheet</button>
+        <button type="button" class="study-chip" data-action="revision">Revision sheet <span class="study-chip-pro"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-spark"></use></svg> PRO</span></button>
       </div>
       <div class="study-fields">
         <label>Source document
@@ -6955,15 +7691,83 @@ html { scroll-behavior: smooth; }
       <label class="extracted-label" for="studyText">Notes to study</label>
       <textarea class="study-notes" id="studyText" dir="auto" placeholder="Select a saved document above, or paste notes here. The AI will not invent facts outside this text."></textarea>
       <div class="upload-actions" style="margin-top:14px;">
-        <button type="button" class="btn-3d btn-primary" id="studyGenerateBtn"><span aria-hidden="true">✧</span> Generate study material</button>
+        <button type="button" class="btn-3d btn-primary" id="studyGenerateBtn" data-tooltip="Generate a summary, key points and Q&amp;A from your notes"><svg class="btn-ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-spark"></use></svg> Generate study material</button>
         <p id="studyStatus" role="status" aria-live="polite" style="font-size:12px;color:var(--text-muted);"></p>
+      </div>
+
+      <!-- Pro tools: rendered in Advanced mode only -->
+      <div class="study-pro-tools" id="studyProTools">
+        <div class="study-pro-head">
+          <span class="study-pro-eyebrow">PRO TOOLS</span>
+          <p>Interactive study modes — available in Advanced mode.</p>
+        </div>
+        <div class="study-pro-grid">
+          <button type="button" class="study-pro-card" id="chatNotesToggle" aria-expanded="false" aria-controls="chatNotesPanel">
+            <span class="study-pro-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-chat"></use></svg></span>
+            <span class="study-pro-copy"><strong>Chat with Notes</strong><small>Ask questions grounded in your document</small></span>
+            <svg class="study-pro-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
+          </button>
+          <button type="button" class="study-pro-card" id="flashcardModeToggle" aria-expanded="false" aria-controls="flashcardPanel">
+            <span class="study-pro-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-cards"></use></svg></span>
+            <span class="study-pro-copy"><strong>Flashcard Mode</strong><small>3D flip cards for active recall</small></span>
+            <svg class="study-pro-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
+          </button>
+        </div>
+
+        <div class="chat-panel" id="chatNotesPanel" hidden>
+          <div class="chat-suggestions">
+            <button type="button" class="chat-suggestion" data-chat-suggestion="Summarize this document in five bullet points.">Summarize</button>
+            <button type="button" class="chat-suggestion" data-chat-suggestion="What are the key definitions I should memorize?">Key definitions</button>
+            <button type="button" class="chat-suggestion" data-chat-suggestion="What is most likely to appear in an exam from these notes?">Exam focus</button>
+          </div>
+          <div class="chat-log" id="chatLog" aria-live="polite">
+            <div class="chat-empty">
+              <svg class="chat-empty-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-chat"></use></svg>
+              <strong>Ask anything about your notes</strong>
+              <p>Answers stay grounded in the selected document or the notes you paste above.</p>
+            </div>
+          </div>
+          <form class="chat-compose" id="chatForm">
+            <input class="chat-input" id="chatInput" type="text" maxlength="600" autocomplete="off" placeholder="Ask a question about your notes…" aria-label="Ask a question about your notes" />
+            <button type="submit" class="btn-3d btn-primary" id="chatSendBtn" data-tooltip="Ask a question answered only from your notes">Ask</button>
+          </form>
+          <p class="chat-hint" id="chatStatus" role="status" aria-live="polite"></p>
+        </div>
+
+        <div class="flashcard-panel" id="flashcardPanel" hidden>
+          <div class="fc-toolbar">
+            <button type="button" class="btn-3d btn-primary" id="fcGenerateBtn" data-tooltip="Turn your notes into a flip-through flashcard deck"><svg class="btn-ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-cards"></use></svg> Generate deck</button>
+            <span class="fc-progress" id="fcProgress">0 / 0</span>
+          </div>
+          <div class="fc-bar" aria-hidden="true"><span id="fcBar"></span></div>
+          <div class="fc-stage">
+            <div class="fc-card" id="fcCard" tabindex="0" role="button" aria-label="Flip flashcard. Press Enter or Space to reveal the answer.">
+              <div class="fc-face fc-front">
+                <span class="fc-tag">QUESTION</span>
+                <p id="fcQuestion">Generate a deck to start.</p>
+                <small>Click to reveal the answer</small>
+              </div>
+              <div class="fc-face fc-back">
+                <span class="fc-tag">ANSWER</span>
+                <p id="fcAnswer">Your answer will appear here.</p>
+                <small>Click to flip back</small>
+              </div>
+            </div>
+          </div>
+          <div class="fc-controls">
+            <button type="button" class="btn-3d btn-secondary" id="fcPrevBtn">‹ Prev</button>
+            <button type="button" class="btn-3d btn-secondary" id="fcFlipBtn">Flip</button>
+            <button type="button" class="btn-3d btn-secondary" id="fcNextBtn">Next ›</button>
+          </div>
+          <p class="fc-hint" id="fcStatus" role="status" aria-live="polite"></p>
+        </div>
       </div>
       <div class="study-result" id="studyResult" hidden>
         <div class="study-result-head">
           <strong id="studyResultTitle">Study result</strong>
           <div class="study-set-actions">
-            <button type="button" class="btn-3d btn-secondary" id="studyCopyBtn">Copy</button>
-            <button type="button" class="btn-3d btn-secondary" id="studySaveBtn">Save</button>
+            <button type="button" class="btn-3d btn-secondary" id="studyCopyBtn" data-tooltip="Copy the generated study material to your clipboard">Copy</button>
+            <button type="button" class="btn-3d btn-secondary" id="studySaveBtn" data-tooltip="Save this study material to your library">Save</button>
             <button type="button" class="btn-3d btn-primary" id="studyUseBtn">Use in PDF Studio</button>
           </div>
         </div>
@@ -7045,9 +7849,137 @@ html { scroll-behavior: smooth; }
         </div>
       </div>
     </article>
+    {% elif page == 'search' %}
+    <article class="panel search-panel" id="searchPanel">
+      <div class="search-hero">
+        <div class="search-input-wrap">
+          <span class="search-input-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg></span>
+          <input type="search" id="globalSearchInput" class="search-input" placeholder="Search across all your documents..." autocomplete="off" aria-label="Search across all your documents" />
+        </div>
+      </div>
+      <div class="search-results" id="searchResults" aria-live="polite">
+        <div class="empty-state">
+          <div class="empty-state-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg></div>
+          <h4>Start typing to search</h4>
+          <p>Results from your documents will appear here.</p>
+        </div>
+      </div>
+    </article>
+
+    {% elif page == 'subscription' %}
+    <article class="panel plan-card depth-3 sheen" id="workspacePlanCard">
+      <div class="plan-head">
+        <div class="panel-eyebrow">CURRENT PLAN</div>
+        <div class="plan-title-wrap">
+          <h3 id="planTitle">Loading plan…</h3>
+          <span class="plan-badge" id="planBadge">—</span>
+        </div>
+      </div>
+      <p id="planDesc">Your active NotesAI plan and usage.</p>
+      <div class="plan-stats" id="planStats" style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px;">
+        <div class="plan-stat">
+          <div class="plan-stat-value" id="planMaxDocs">—</div>
+          <div class="plan-bar" role="progressbar" aria-label="Document usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="planDocsBar"></span></div>
+          <div class="plan-stat-label">Documents</div>
+        </div>
+        <div class="plan-stat">
+          <div class="plan-stat-value" id="planStorage">—</div>
+          <div class="plan-bar" role="progressbar" aria-label="Storage usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="planStorageBar"></span></div>
+          <div class="plan-stat-label">Storage</div>
+        </div>
+        <div class="plan-stat">
+          <div class="plan-stat-value" id="planStatus">—</div>
+          <div class="plan-stat-label">Status</div>
+        </div>
+      </div>
+    </article>
+
+    <div class="plan-grid" aria-label="Available plans">
+      <article class="plan-card" data-plan-card="free">
+        <h4 class="plan-name">Free</h4>
+        <div class="plan-price">$0<span class="plan-period"> / month</span></div>
+        <ul class="plan-features">
+          <li class="plan-feature"><span class="plan-feature-icon" aria-hidden="true">✓</span> 100 documents</li>
+          <li class="plan-feature"><span class="plan-feature-icon" aria-hidden="true">✓</span> 250 MB storage</li>
+          <li class="plan-feature"><span class="plan-feature-icon" aria-hidden="true">✓</span> Core AI study tools</li>
+        </ul>
+        <button type="button" class="btn-3d btn-secondary plan-action-btn" data-plan-action="free">Stay on Free</button>
+      </article>
+      <article class="plan-card" data-plan-card="pro">
+        <h4 class="plan-name">Professional</h4>
+        <div class="plan-price">$9<span class="plan-period"> / month</span></div>
+        <ul class="plan-features">
+          <li class="plan-feature"><span class="plan-feature-icon" aria-hidden="true">✓</span> 500 documents</li>
+          <li class="plan-feature"><span class="plan-feature-icon" aria-hidden="true">✓</span> 2 GB storage</li>
+          <li class="plan-feature"><span class="plan-feature-icon" aria-hidden="true">✓</span> Priority AI study and diagrams</li>
+        </ul>
+        <button type="button" class="btn-3d btn-primary plan-action-btn" data-plan-action="pro">Upgrade to Professional</button>
+      </article>
+    </div>
+    <p class="plan-action-status" id="planActionStatus" role="status" aria-live="polite"></p>
+
+    {% elif page == 'help' %}
+    <div class="help-layout">
+      <section class="panel help-faq" aria-labelledby="faqTitle">
+        <div class="panel-header">
+          <div class="panel-eyebrow">KNOWLEDGE BASE</div>
+          <h3 id="faqTitle">Frequently asked questions</h3>
+          <p>Quick answers to the questions we hear most.</p>
+        </div>
+        <div class="faq-list">
+          <details class="faq-item" open>
+            <summary>How do I generate a PDF?</summary>
+            <div class="faq-answer"><p>Open <strong>PDF Studio</strong> (or Create New Order), choose your note images or an existing PDF, pick the page size, orientation and margin, then press <strong>Generate PDF</strong>. The finished file appears in <strong>My Notes</strong> and <strong>Order History</strong>.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary>How does AI Study work?</summary>
+            <div class="faq-answer"><p>AI Study reads the document you select or the notes you paste, then generates summaries, key points, questions, flashcards and revision sheets. It works only from your supplied notes and never invents facts outside them.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary>What is the difference between Simple and Advanced mode?</summary>
+            <div class="faq-answer"><p><strong>Simple</strong> shows four essential actions: Summarize, Key points, Q&amp;A and Flashcards. <strong>Advanced</strong> unlocks all fifteen actions plus Pro tools such as Chat with Notes and Flashcard Mode.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary>How do I use Chat with Notes?</summary>
+            <div class="faq-answer"><p>Switch AI Study to <strong>Advanced</strong>, select a document or paste notes, then open <strong>Chat with Notes</strong>. Ask any question and the assistant answers using only that source material.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary>How do I use Flashcard Mode?</summary>
+            <div class="faq-answer"><p>In <strong>Advanced</strong> mode open <strong>Flashcard Mode</strong>, then press <strong>Generate deck</strong>. Click a card to flip between question and answer, and use Prev / Next to move through the deck.</p></div>
+          </details>
+          <details class="faq-item">
+            <summary>Where are my documents stored?</summary>
+            <div class="faq-answer"><p>Documents stay in this local NotesAI workspace. No online payment gateway or cloud storage provider is claimed. You can download or delete files from <strong>My Notes</strong>, and restore them from <strong>Trash</strong>.</p></div>
+          </details>
+        </div>
+      </section>
+
+      <section class="panel help-contact" aria-labelledby="contactTitle">
+        <div class="panel-header">
+          <div class="panel-eyebrow">SUPPORT</div>
+          <h3 id="contactTitle">Contact support</h3>
+          <p>We usually reply within one business day.</p>
+        </div>
+        <a class="help-contact-row" href="mailto:{{ support_email }}">
+          <span class="help-contact-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-mail"></use></svg></span>
+          <span class="help-contact-copy"><strong>Email support</strong><small>{{ support_email }}</small></span>
+          <svg class="help-contact-arrow" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-arrow-right"></use></svg>
+        </a>
+        <div class="help-contact-row is-static">
+          <span class="help-contact-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-notes"></use></svg></span>
+          <span class="help-contact-copy"><strong>Workspace settings</strong><small>Provider, preferences and appearance</small></span>
+        </div>
+        <div class="help-contact-row is-static">
+          <span class="help-contact-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-admin"></use></svg></span>
+          <span class="help-contact-copy"><strong>Admin tools</strong><small>Storage, billing and failed-job monitoring</small></span>
+        </div>
+        <button type="button" class="btn-3d btn-secondary help-copy-btn" id="helpCopyEmail" data-email="{{ support_email }}" data-tooltip="Copy the support email address">Copy support email</button>
+        <p class="help-note">No online payment gateway or cloud provider is claimed. Documents stay in your local workspace.</p>
+      </section>
+    </div>
     {% endif %}
 
-    {% if page not in ['study', 'admin'] %}
+    {% if page not in ['study', 'admin', 'search', 'subscription', 'help'] %}
     <!-- Activity / My Notes / History / Settings Panel -->
     <article class="panel" id="activity">
       <div class="panel-header">
@@ -7082,10 +8014,11 @@ html { scroll-behavior: smooth; }
       </div>
       <!-- My Notes Grid -->
       <div class="document-grid" id="documentGrid">
-        <div class="empty-state">
-          <div class="empty-state-icon" aria-hidden="true">▤</div>
+        <div class="empty-state enhanced">
+          <div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 64 64"><use href="#icon-empty-docs"></use></svg></div>
           <h4>No documents yet</h4>
-          <p>Create your first document from the PDF Studio or New Order page.</p>
+          <p>Turn your notes into a clean PDF and it will live here, ready to search and study.</p>
+          <a class="btn-3d btn-primary" href="/new-order">Create your first document</a>
         </div>
       </div>
       <div class="pagination" id="documentPager"></div>
@@ -7105,7 +8038,7 @@ html { scroll-behavior: smooth; }
       <!-- History List -->
       <div class="order-list" id="orderList">
         <div class="empty-state">
-          <div class="empty-state-icon" aria-hidden="true">◷</div>
+          <div class="empty-state-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-history"></use></svg></div>
           <h4>No orders yet</h4>
           <p>Your completed and processing orders will appear here.</p>
         </div>
@@ -7191,10 +8124,11 @@ html { scroll-behavior: smooth; }
       {% else %}
       <!-- Default Dashboard Activity -->
       <div class="activity-list" id="activityList">
-        <div class="empty-state">
-          <div class="empty-state-icon" aria-hidden="true">◷</div>
+        <div class="empty-state enhanced">
+          <div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 64 64"><use href="#icon-empty-activity"></use></svg></div>
           <h4>No recent activity</h4>
-          <p>Your document conversions and orders will appear here.</p>
+          <p>Every upload, extraction and download will show up here as it happens.</p>
+          <a class="btn-3d btn-primary" href="/new-order">Create your first document</a>
         </div>
       </div>
       {% endif %}
@@ -7202,7 +8136,7 @@ html { scroll-behavior: smooth; }
     {% endif %}
   </section>
 
-  {% if page == 'dashboard' %}
+  {% if page in ['dashboard', 'home'] %}
   <footer class="footer">NOTESAI · PREMIUM WORKSPACE FOR REFINED THINKING</footer>
   {% endif %}
 </main>
@@ -7287,6 +8221,17 @@ html { scroll-behavior: smooth; }
 
 <!-- Toast Container -->
 <div class="toast-container" id="toastContainer" aria-live="polite" aria-atomic="true"></div>
+<div class="page-transition" id="pageTransition" aria-hidden="true">
+  <div class="page-transition-inner">
+    <div class="page-transition-head"><div class="skeleton"></div><div class="skeleton skeleton-line short"></div></div>
+    <div class="skeleton skeleton-card"></div>
+    <div class="skeleton-grid">
+      <div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-card"></div>
+    </div>
+  </div>
+</div>
 
 <script>
 // ============================================================
@@ -7347,6 +8292,7 @@ html { scroll-behavior: smooth; }
   const statPlan = document.getElementById('statPlan');
   const statPlanDesc = document.getElementById('statPlanDesc');
   const dashboardRecent = document.getElementById('dashboardRecent');
+  const dashboardActivity = document.getElementById('dashboardActivity');
   const documentModal = document.getElementById('documentModal');
   const documentModalId = document.getElementById('documentModalId');
   const documentModalName = document.getElementById('documentModalName');
@@ -7496,8 +8442,67 @@ html { scroll-behavior: smooth; }
     }
   }
 
+  const DIAGRAM_STYLE_GROUPS = {
+    biology: [['pencil', 'Pencil Sketch'], ['medical', 'Colorful Medical Diagram']],
+    physics: [['vector', 'Clean Vector'], ['schematic', 'Schematic Style']],
+    chemistry: [['molecule2d', 'Molecule 2D'], ['structure3d', '3D Structure']],
+    geography: [['outline', 'Clean Outline'], ['topographic', 'Topographic']],
+    general: [['color', 'Color Digital Diagram'], ['pencil', 'Pencil Sketch Diagram']]
+  };
+  const DIAGRAM_STYLE_LABELS = {
+    biology: 'Biology / Anatomy', physics: 'Physics / Circuits',
+    chemistry: 'Chemistry', geography: 'Geography / Maps', general: 'General diagram'
+  };
+  const DIAGRAM_STYLE_VALUES = new Set([
+    'color', 'pencil', '3d', 'simple', 'medical', 'vector', 'schematic',
+    'molecule2d', 'structure3d', 'outline', 'topographic'
+  ]);
+
+  function detectDiagramSubject(analysis) {
+    const scores = { biology: 0, physics: 0, chemistry: 0, geography: 0, general: 0 };
+    ((analysis && analysis.pages) || []).forEach(page => {
+      ((page && page.diagrams) || []).forEach(diagram => {
+        const text = `${diagram.category || ''} ${diagram.type || ''} ${diagram.title || ''}`.toLowerCase();
+        if (/(bio|anatom|heart|cell|plant|human|brain|eye|ear|kidney|lung|skeleton|muscle|nerve|digest)/.test(text)) scores.biology += 2;
+        else if (/(physic|circuit|electric|engineering|mechanic|optic|magnet)/.test(text)) scores.physics += 2;
+        else if (/(chem|molecul|atom|reaction|bond|organic|compound)/.test(text)) scores.chemistry += 2;
+        else if (/(geograph|map|topograph|continent|country|river|mountain|climate|earth)/.test(text)) scores.geography += 2;
+        else scores.general += 1;
+      });
+    });
+    let subject = 'general';
+    Object.keys(scores).forEach(key => {
+      if (scores[key] > scores[subject]) subject = key;
+    });
+    return subject;
+  }
+
+  let diagramStyleRefreshPending = false;
+  function populateDiagramStyles(analysis) {
+    if (!diagramStyleSelect) return;
+    const subject = detectDiagramSubject(analysis);
+    const choices = DIAGRAM_STYLE_GROUPS[subject] || DIAGRAM_STYLE_GROUPS.general;
+    const previous = diagramStyleSelect.value;
+    diagramStyleSelect.innerHTML = choices.map(choice =>
+      `<option value="${choice[0]}">${choice[1]}</option>`).join('');
+    diagramStyleSelect.value = choices.some(choice => choice[0] === previous)
+      ? previous : choices[0][0];
+    const subjectEl = document.getElementById('diagramStyleSubject');
+    if (subjectEl) subjectEl.textContent = `Detected: ${DIAGRAM_STYLE_LABELS[subject]}`;
+    // Automatic subject detection can change the style; keep previews in sync.
+    const changed = Boolean(previous) && previous !== diagramStyleSelect.value;
+    if (changed && !diagramStyleRefreshPending && pdfModeSelect && pdfModeSelect.value === 'smart') {
+      diagramStyleRefreshPending = true;
+      setTimeout(() => {
+        diagramStyleRefreshPending = false;
+        refreshAllDiagramPreviews();
+      }, 0);
+    }
+  }
+
   function currentDiagramStyle() {
-    return diagramStyleSelect && diagramStyleSelect.value === 'pencil' ? 'pencil' : 'color';
+    const value = diagramStyleSelect ? diagramStyleSelect.value : 'color';
+    return DIAGRAM_STYLE_VALUES.has(value) ? value : 'color';
   }
 
   // ----- Safe browser storage (private mode / blocked storage must not stop init) -----
@@ -7854,6 +8859,12 @@ html { scroll-behavior: smooth; }
       smartReview.style.display = 'none';
       return;
     }
+    populateDiagramStyles(currentAnalysis);
+    // The review and its diagram settings belong to Smart PDF only.
+    if (!pdfModeSelect || pdfModeSelect.value !== 'smart') {
+      smartReview.style.display = 'none';
+      return;
+    }
     const pages = currentAnalysis.pages || [];
     let html = '';
     if ((currentAnalysis.warnings || []).length) {
@@ -8061,9 +9072,24 @@ html { scroll-behavior: smooth; }
   }
 
   // ----- Utility Functions -----
+  function dismissToast(toast) {
+    if (!toast || !toast.isConnected) return;
+    toast.classList.add('toast-out');
+    setTimeout(() => toast.remove(), 180);
+  }
+
+  // Avoid a stack of identical toasts when an action fires more than once.
+  const recentToasts = new Map();
   function showToast(message, type = 'info', duration = 4000, action = null) {
+    const key = type + '|' + String(message);
+    const now = Date.now();
+    if (!action && recentToasts.has(key) && now - recentToasts.get(key) < 1500) return;
+    if (recentToasts.size > 40) recentToasts.delete(recentToasts.keys().next().value);
+    recentToasts.set(key, now);
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+    toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
     const icons = {
       success: '✓',
       error: '✕',
@@ -8081,21 +9107,21 @@ html { scroll-behavior: smooth; }
     close.className = 'toast-close';
     close.setAttribute('aria-label', 'Dismiss');
     close.innerHTML = '&times;';
-    close.addEventListener('click', () => toast.remove());
+    close.addEventListener('click', () => dismissToast(toast));
     toast.append(icon, text);
     if (action && typeof action.onClick === 'function') {
       const button = document.createElement('button');
       button.className = 'toast-action';
       button.textContent = action.label || 'Retry';
       button.addEventListener('click', () => {
-        toast.remove();
+        dismissToast(toast);
         action.onClick();
       });
       toast.appendChild(button);
     }
     toast.appendChild(close);
     toastContainer.appendChild(toast);
-    if (duration > 0) setTimeout(() => toast.remove(), duration);
+    if (duration > 0) setTimeout(() => dismissToast(toast), duration);
     return toast;
   }
 
@@ -8128,10 +9154,20 @@ html { scroll-behavior: smooth; }
       btn.classList.add('btn-loading');
       btn.disabled = true;
       btn.setAttribute('aria-busy', 'true');
+      // Save original text and show "Generating..."
+      if (!btn.dataset.originalText) {
+        btn.dataset.originalText = btn.innerHTML;
+      }
+      btn.innerHTML = '<svg class="btn-ico" aria-hidden="true"><use href="#icon-spark"></use></svg> Generating...';
     } else {
       btn.classList.remove('btn-loading');
       btn.disabled = false;
       btn.removeAttribute('aria-busy');
+      // Restore original text
+      if (btn.dataset.originalText) {
+        btn.innerHTML = btn.dataset.originalText;
+        delete btn.dataset.originalText;
+      }
     }
   }
 
@@ -8316,7 +9352,7 @@ html { scroll-behavior: smooth; }
     parts.panel.classList.remove('success', 'error', 'cancelled');
     parts.panel.setAttribute('aria-busy', 'true');
     const orb = parts.panel.querySelector('.processing-orb');
-    if (orb) orb.textContent = orb.dataset.icon || (kind === 'ai' ? '✦' : '◈');
+    if (orb && !orb.querySelector('svg')) orb.textContent = orb.dataset.icon || '';
     if (parts.title) parts.title.textContent = title || 'Processing';
     if (parts.subtitle) parts.subtitle.textContent = subtitle || 'Please keep this page open.';
     if (parts.percent) parts.percent.textContent = 'Preparing…';
@@ -8489,41 +9525,135 @@ html { scroll-behavior: smooth; }
 
   // ----- API Calls -----
   async function fetchStats() {
+    const statsEls = [statProgress, statCompleted, statFailed];
+    statsEls.forEach(el => {
+      if (el) el.innerHTML = '<span class="skeleton skeleton-stat" aria-hidden="true"></span>';
+    });
     try {
-      const res = await fetch('/api/stats');
-      if (res.ok) {
-        const data = await res.json();
-        if (statProgress) statProgress.textContent = data.in_progress || 0;
-        if (statCompleted) statCompleted.textContent = data.completed || 0;
-        if (statFailed) statFailed.textContent = data.failed || 0;
-      }
-    } catch (_) {}
-    fetchPlan();
+      const res = await fetchWithTimeout('/api/stats', { cache: 'no-store' }, 15000);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const values = [data.in_progress, data.completed, data.failed];
+      statsEls.forEach((el, index) => {
+        if (el) el.textContent = String(values[index] == null ? 0 : values[index]);
+      });
+    } catch (_) {
+      // Never leave a card spinning forever; show an honest placeholder.
+      statsEls.forEach(el => { if (el) el.textContent = '—'; });
+      showToast('Could not load workspace statistics.', 'error', 5000, {
+        label: 'Retry',
+        onClick: fetchStats
+      });
+    } finally {
+      fetchPlan();
+    }
   }
 
   async function fetchPlan() {
-    if (!statPlan) return;
+    const planTitle = document.getElementById('planTitle');
+    const planBadge = document.getElementById('planBadge');
+    const planMaxDocs = document.getElementById('planMaxDocs');
+    const planStorage = document.getElementById('planStorage');
+    const planStatus = document.getElementById('planStatus');
+    const planDocsBar = document.getElementById('planDocsBar');
+    const planStorageBar = document.getElementById('planStorageBar');
+    if (!planTitle && !planMaxDocs && !planStorage && !planStatus) return;
+
+    // Skeleton placeholders replace the old "Loading plan…" text.
+    [planTitle, planMaxDocs, planStorage, planStatus].forEach(el => {
+      if (el) el.innerHTML = '<span class="skeleton skeleton-line" aria-hidden="true"></span>';
+    });
+    if (planBadge) planBadge.textContent = '…';
+    [planDocsBar, planStorageBar].forEach(bar => {
+      const track = bar && bar.parentElement;
+      if (track) track.classList.add('is-loading');
+    });
+
+    const setPlanBar = (el, used, max) => {
+      if (!el) return;
+      const pct = max > 0 ? Math.max(0, Math.min(100, (used / max) * 100)) : 0;
+      el.style.width = pct.toFixed(1) + '%';
+      const track = el.parentElement;
+      if (track) {
+        track.classList.remove('is-loading');
+        track.classList.toggle('is-warn', pct >= 75 && pct < 100);
+        track.classList.toggle('is-full', pct >= 100);
+        if (track.hasAttribute('aria-valuenow')) {
+          track.setAttribute('aria-valuenow', String(Math.round(pct)));
+        }
+      }
+    };
+
+    const applyFallback = () => {
+      if (planTitle) planTitle.textContent = 'Free workspace';
+      if (planBadge) planBadge.textContent = 'FREE';
+      if (planMaxDocs) planMaxDocs.textContent = '0 / 100 Documents';
+      if (planStorage) planStorage.textContent = '0 B / 250 MB';
+      if (planStatus) planStatus.textContent = 'active';
+      setPlanBar(planDocsBar, 0, 100);
+      setPlanBar(planStorageBar, 0, 250);
+      document.querySelectorAll('[data-plan-card]').forEach((card) => {
+        card.classList.toggle('selected', card.getAttribute('data-plan-card') === 'free');
+      });
+    };
+
     try {
       const res = await fetch('/api/plan', { cache: 'no-store' });
-      if (!res.ok) return;
+      if (!res.ok) throw new Error('plan request failed');
       const data = await res.json();
-      statPlan.textContent = data.label || 'Free workspace';
-      if (statPlanDesc) {
-        const limits = data.limits || {};
-        statPlanDesc.textContent = `${limits.max_documents || 100} documents · ${limits.max_storage_mb || 250} MB target`;
-      }
-    } catch (_) {}
+      const limits = data.limits || {};
+      const maxDocs = Number(limits.max_documents) || 100;
+      const maxStorage = Number(limits.max_storage_mb) || 250;
+
+      let usedDocs = 0;
+      let usedBytes = 0;
+      try {
+        const docsRes = await fetch('/api/documents', { cache: 'no-store' });
+        if (docsRes.ok) {
+          const docs = await docsRes.json();
+          const active = (Array.isArray(docs) ? docs : []).filter(doc => !doc.deleted_at);
+          usedDocs = active.length;
+          usedBytes = active.reduce((sum, doc) => sum + Number(doc.size || 0), 0);
+        }
+      } catch (_) {}
+
+      if (planTitle) planTitle.textContent = data.label || 'Free workspace';
+      if (planBadge) planBadge.textContent = String(data.plan || 'free').toUpperCase();
+      if (planMaxDocs) planMaxDocs.textContent = `${usedDocs} / ${maxDocs} Documents`;
+      if (planStorage) planStorage.textContent = `${formatBytes(usedBytes)} / ${maxStorage} MB`;
+      if (planStatus) planStatus.textContent = data.status || 'active';
+      setPlanBar(planDocsBar, usedDocs, maxDocs);
+      setPlanBar(planStorageBar, usedBytes / (1024 * 1024), maxStorage);
+      document.querySelectorAll('[data-plan-card]').forEach((card) => {
+        card.classList.toggle('selected', card.getAttribute('data-plan-card') === (data.plan || 'free'));
+      });
+    } catch (_) {
+      applyFallback();
+    }
   }
 
   async function fetchActivity() {
-    if (!activityList) return;
+    if (!activityList && !dashboardActivity) return;
+    if (activityList) renderCompactLoading(activityList, 'Loading activity');
+    if (dashboardActivity) renderCompactLoading(dashboardActivity, 'Loading activity');
     try {
       const res = await fetch('/api/activity');
       if (res.ok) {
         const data = await res.json();
         renderActivity(data);
+      } else {
+        throw new Error('Could not load activity.');
       }
-    } catch (_) {}
+    } catch (_) {
+      if (activityList) activityList.innerHTML = emptyStateMarkup(
+        'activity', 'Could not load activity', 'Refresh to try again.', 'Retry', window.location.pathname
+      );
+      if (dashboardActivity) dashboardActivity.innerHTML = '<div class="empty-state compact"><p>Could not load activity.</p></div>';
+      showToast('Could not load recent activity.', 'error', 5000, { label: 'Retry', onClick: fetchActivity });
+    } finally {
+      if (activityList) activityList.setAttribute('aria-busy', 'false');
+      if (dashboardActivity) dashboardActivity.setAttribute('aria-busy', 'false');
+    }
   }
 
   function renderListLoading(container, label) {
@@ -8544,7 +9674,7 @@ html { scroll-behavior: smooth; }
     container.setAttribute('aria-busy', 'false');
     container.innerHTML = `
       <div class="empty-state" style="grid-column: 1 / -1; width: 100%;">
-        <div class="empty-state-icon" aria-hidden="true">⚠</div>
+        <div class="empty-state-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-alert"></use></svg></div>
         <h4>${label}</h4>
         <p>Check that NotesAI is running, then try again.</p>
         <button type="button" class="btn-3d btn-secondary" data-retry>Retry</button>
@@ -8554,9 +9684,31 @@ html { scroll-behavior: smooth; }
     if (button) button.addEventListener('click', retry);
   }
 
+  function renderCompactLoading(container, label) {
+    if (!container) return;
+    container.setAttribute('aria-busy', 'true');
+    const rows = Array.from({ length: 3 }, () => '<div class="skeleton skeleton-mini-row"></div>').join('');
+    container.innerHTML = `<div class="skeleton-block">${rows}</div><span class="visually-hidden">${label}. Please wait a moment.</span>`;
+  }
+
+  function emptyStateMarkup(kind, title, text, ctaLabel, ctaHref, compact = false) {
+    const symbol = kind === 'activity' ? 'icon-empty-activity' : 'icon-empty-docs';
+    return `
+      <div class="empty-state${compact ? ' compact' : ' enhanced'}">
+        <div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 64 64"><use href="#${symbol}"></use></svg></div>
+        <h4>${escapeHtml(title)}</h4>
+        <p>${escapeHtml(text)}</p>
+        <a class="btn-3d btn-primary" href="${escapeHtml(ctaHref)}">${escapeHtml(ctaLabel)}</a>
+      </div>`;
+  }
+
   async function fetchDocuments() {
     if (!documentGrid && !dashboardRecent && !statTotal && !statStorage) return;
     if (documentGrid) renderListLoading(documentGrid, 'Loading documents');
+    if (dashboardRecent) renderCompactLoading(dashboardRecent, 'Loading documents');
+    [statTotal, statStorage].forEach(el => {
+      if (el) el.innerHTML = '<span class="skeleton skeleton-stat" aria-hidden="true"></span>';
+    });
     try {
       const url = documentShowTrash ? '/api/documents?trash=1' : '/api/documents';
       const res = await fetchWithTimeout(url, { cache: 'no-store' }, 30000);
@@ -8570,6 +9722,9 @@ html { scroll-behavior: smooth; }
       }
     } catch (_) {
       if (documentGrid) renderListError(documentGrid, 'Could not load documents', fetchDocuments);
+      if (dashboardRecent) dashboardRecent.innerHTML = '<div class="empty-state compact"><p>Could not load documents.</p></div>';
+      if (statTotal) statTotal.textContent = '—';
+      if (statStorage) statStorage.textContent = '—';
       if (documentCount) documentCount.textContent = '—';
       showToast('Could not load document history. Please retry.', 'error', 6000, {
         label: 'Retry',
@@ -8577,6 +9732,7 @@ html { scroll-behavior: smooth; }
       });
     } finally {
       if (documentGrid) documentGrid.setAttribute('aria-busy', 'false');
+      if (dashboardRecent) dashboardRecent.setAttribute('aria-busy', 'false');
     }
   }
 
@@ -8658,12 +9814,15 @@ html { scroll-behavior: smooth; }
     }
     if (!dashboardRecent) return;
     if (!activeDocs.length) {
-      dashboardRecent.innerHTML = '<div class="empty-state" style="padding:16px;"><p>No documents yet.</p></div>';
+      dashboardRecent.innerHTML = emptyStateMarkup(
+        'docs', 'No documents yet', 'Generate your first PDF to see it here.',
+        'Create your first document', '/new-order', true
+      );
       return;
     }
     dashboardRecent.innerHTML = activeDocs.slice(0, 4).map(doc => `
       <a class="recent-mini" href="/my-notes">
-        <span class="recent-mini-icon" aria-hidden="true">▤</span>
+        <span class="recent-mini-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-notes"></use></svg></span>
         <span style="min-width:0;">
           <strong>${escapeHtml(doc.name || 'Untitled document')}</strong>
           <small>${formatBytes(doc.size)} · ${escapeHtml(formatDate(doc.created))}</small>
@@ -8687,39 +9846,61 @@ html { scroll-behavior: smooth; }
 
   // ----- Render Functions -----
   function renderActivity(activities) {
-    if (!activities.length) {
-      activityList.innerHTML = `
-        <div class="empty-state">
-          <div class="empty-state-icon" aria-hidden="true">◷</div>
-          <h4>No recent activity</h4>
-          <p>Your document conversions and orders will appear here.</p>
-        </div>
-      `;
+    if (!activityList && !dashboardActivity) return;
+    const list = Array.isArray(activities) ? activities : [];
+    if (!list.length) {
+      if (activityList) {
+        activityList.innerHTML = emptyStateMarkup(
+          'activity', 'No recent activity',
+          'Every upload, extraction and download will show up here as it happens.',
+          'Create your first document', '/new-order'
+        );
+      }
+      if (dashboardActivity) {
+        dashboardActivity.innerHTML = emptyStateMarkup(
+          'activity', 'No recent activity', 'Your document actions will appear here.',
+          'Create your first document', '/new-order', true
+        );
+      }
       return;
     }
-    activityList.innerHTML = activities.map(a => `
-      <div class="activity-item">
-        <div class="activity-icon" aria-hidden="true">${getActivityIcon(a.action)}</div>
-        <div class="activity-content">
-          <div class="activity-title">${escapeHtml(a.action)}</div>
-          <div class="activity-detail">${escapeHtml(a.detail)}</div>
+    if (activityList) {
+      activityList.innerHTML = list.map(a => `
+        <div class="activity-item">
+          <div class="activity-icon" aria-hidden="true">${getActivityIcon(a.action)}</div>
+          <div class="activity-content">
+            <div class="activity-title">${escapeHtml(a.action)}</div>
+            <div class="activity-detail">${escapeHtml(a.detail)}</div>
+          </div>
+          <span class="activity-status ${escapeHtml(a.status)}">${escapeHtml(a.status)}</span>
+          <time class="activity-time" datetime="${escapeHtml(a.timestamp)}">${formatDate(a.timestamp)}</time>
         </div>
-        <span class="activity-status ${escapeHtml(a.status)}">${escapeHtml(a.status)}</span>
-        <time class="activity-time" datetime="${escapeHtml(a.timestamp)}">${formatDate(a.timestamp)}</time>
-      </div>
-    `).join('');
+      `).join('');
+    }
+    if (dashboardActivity) {
+      dashboardActivity.innerHTML = list.slice(0, 4).map(a => `
+        <div class="activity-item" style="padding:10px;gap:10px;">
+          <div class="activity-icon" style="width:32px;height:32px;border-radius:9px;" aria-hidden="true">${getActivityIcon(a.action)}</div>
+          <div class="activity-content" style="min-width:0;">
+            <div class="activity-title" style="font-size:11px;">${escapeHtml(a.action)}</div>
+            <div class="activity-detail" style="font-size:10px;">${escapeHtml(a.detail)}</div>
+          </div>
+        </div>
+      `).join('');
+    }
   }
 
   function getActivityIcon(action) {
     const icons = {
-      'Upload': '⇧',
-      'Extract': '✧',
-      'Generate PDF': '⟳',
-      'Download': '⤓',
-      'Create Order': '＋',
-      'Settings': '⚙'
+      'Upload': 'icon-upload',
+      'Extract': 'icon-spark',
+      'Generate PDF': 'icon-spark',
+      'Download': 'icon-download',
+      'Create Order': 'icon-plus',
+      'Settings': 'icon-settings'
     };
-    return icons[action] || '▤';
+    const iconId = icons[action] || 'icon-notes';
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#' + iconId + '"></use></svg>';
   }
 
   function renderDocuments(docs, hasAny) {
@@ -8727,7 +9908,7 @@ html { scroll-behavior: smooth; }
       const inTrash = documentShowTrash;
       documentGrid.innerHTML = `
         <div class="empty-state" style="grid-column: 1 / -1;">
-          <div class="empty-state-icon" aria-hidden="true">${hasAny ? '⌕' : '▤'}</div>
+          <div class="empty-state-icon" aria-hidden="true">${hasAny ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg>' : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-notes"></use></svg>'}</div>
           <h4>${inTrash ? 'Trash is empty' : hasAny ? 'No matching documents' : 'No documents yet'}</h4>
           <p>${inTrash ? 'Deleted documents appear here until you restore them.' : hasAny ? 'Try a different search term or filter.' : 'Create your first document from PDF Studio.'}</p>
         </div>
@@ -8746,7 +9927,7 @@ html { scroll-behavior: smooth; }
       ].filter(Boolean).join('');
       return `
       <article class="document-card">
-        ${d.thumbnail ? `<img src="${escapeHtml(d.thumbnail)}" alt="" class="document-thumb" loading="lazy">` : '<div class="document-thumb" style="display:grid;place-items:center;color:var(--text-muted);font-size:32px;">▤</div>'}
+        ${d.thumbnail ? `<img src="${escapeHtml(d.thumbnail)}" alt="" class="document-thumb" loading="lazy">` : '<div class="document-thumb" style="display:grid;place-items:center;color:var(--text-muted);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="width:30px;height:30px;"><use href="#icon-notes"></use></svg></div>'}
         <div class="document-info">
           <span class="document-name" title="${escapeHtml(d.name)}">${escapeHtml(d.name)}</span>
           <div class="document-meta">
@@ -8876,7 +10057,7 @@ html { scroll-behavior: smooth; }
     if (!orders.length) {
       orderList.innerHTML = `
         <div class="empty-state" style="width:100%;">
-          <div class="empty-state-icon" aria-hidden="true">${hasAny ? '⌕' : '◷'}</div>
+          <div class="empty-state-icon" aria-hidden="true">${hasAny ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg>' : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-history"></use></svg>'}</div>
           <h4>${hasAny ? 'No matching orders' : 'No orders yet'}</h4>
           <p>${hasAny ? 'Try a different search term or status filter.' : 'Your completed and processing orders will appear here.'}</p>
         </div>
@@ -8907,8 +10088,9 @@ html { scroll-behavior: smooth; }
   }
 
   function getOrderIcon(type) {
-    const icons = { pdf: '▤', text: '✎', image: '▥' };
-    return icons[type] || '▤';
+    const icons = { pdf: 'icon-notes', text: 'icon-notes', image: 'icon-image' };
+    const iconId = icons[type] || 'icon-notes';
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#' + iconId + '"></use></svg>';
   }
 
   // ----- Job identity (prevents duplicate statistic counting) -----
@@ -8989,7 +10171,7 @@ html { scroll-behavior: smooth; }
       remove.type = 'button';
       remove.className = 'file-remove';
       remove.setAttribute('aria-label', 'Remove ' + file.name);
-      remove.innerHTML = '&times;';
+      remove.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
       remove.addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
@@ -9051,6 +10233,7 @@ html { scroll-behavior: smooth; }
       renderFilePreview();
       refreshJobId();
       dropzone.classList.remove('drag-active');
+      showToast(added + (added === 1 ? ' file is' : ' files are') + ' ready to extract.', 'success', 2600);
     }
   }
 
@@ -9818,6 +11001,12 @@ html { scroll-behavior: smooth; }
   }
 
   async function loadProviderStatus() {
+    const loadingEls = [providerSaveStatus, geminiStatus, openrouterStatus, openrouterFreeCount];
+    loadingEls.forEach(el => {
+      if (!el) return;
+      el.dataset.skeleton = '1';
+      el.innerHTML = '<span class="skeleton skeleton-line short" aria-hidden="true"></span>';
+    });
     try {
       const res = await fetch('/api/provider-status?_=' + Date.now(), {
         cache: 'no-store',
@@ -9868,13 +11057,15 @@ html { scroll-behavior: smooth; }
           ? ('AI provider: ' + active + (active === 'gemini' ? ' (default)' : ' (free models only)'))
           : 'No AI provider configured.';
       }
+      loadingEls.forEach(el => { if (el) delete el.dataset.skeleton; });
     } catch (_) {
       if (providerSelect) providerSelect.disabled = false;
-      if (providerSaveStatus && providerSaveStatus.textContent === 'Loading active provider…') {
+      if (providerSaveStatus && providerSaveStatus.dataset.skeleton === '1') {
         providerSaveStatus.textContent = 'Could not load active provider. Reload the page.';
       }
       // Do not leave a stale placeholder forever.
       const stale = (el) => !el.textContent ||
+        el.dataset.skeleton === '1' ||
         el.textContent.indexOf('Checking') === 0 ||
         el.textContent === 'Not configured.';
       if (geminiStatus && stale(geminiStatus)) {
@@ -9883,6 +11074,7 @@ html { scroll-behavior: smooth; }
       if (openrouterStatus && stale(openrouterStatus)) {
         openrouterStatus.textContent = 'Status unavailable. Reload the page.';
       }
+      loadingEls.forEach(el => { if (el) delete el.dataset.skeleton; });
     }
   }
 
@@ -10216,6 +11408,103 @@ html { scroll-behavior: smooth; }
   window.addEventListener('pageshow', (event) => {
     if (event.persisted) loadProviderStatus();
   });
+
+  // Touch users get the same hint as desktop hover: press and hold a button.
+  (function initTooltipLongPress() {
+    let timer = null;
+    let hideTimer = null;
+    let active = null;
+    let suppressClick = false;
+    const clear = (hide) => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      if (hide && active) { active.classList.remove('tooltip-open'); active = null; }
+    };
+    document.addEventListener('pointerdown', event => {
+      const target = event.target instanceof Element ? event.target.closest('[data-tooltip]') : null;
+      if (!target) { clear(true); return; }
+      if (event.pointerType && event.pointerType !== 'touch') return;
+      clear(true);
+      active = target;
+      timer = setTimeout(() => {
+        target.classList.add('tooltip-open');
+        suppressClick = true;
+        if (navigator.vibrate) { try { navigator.vibrate(8); } catch (_) {} }
+        hideTimer = setTimeout(() => clear(true), 2400);
+      }, 450);
+    }, { passive: true });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(name => {
+      document.addEventListener(name, () => {
+        if (timer) { clearTimeout(timer); timer = null; }
+      }, { passive: true });
+    });
+    document.addEventListener('scroll', () => clear(true), { passive: true });
+    // A long-press shows help only; it must not also fire the button action.
+    document.addEventListener('click', event => {
+      if (!suppressClick) return;
+      suppressClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+      clear(true);
+    }, true);
+    document.addEventListener('contextmenu', event => {
+      if (active) event.preventDefault();
+    });
+  })();
+
+  // A shimmering placeholder replaces the blank flash between pages.
+  (function initPageTransition() {
+    const overlay = document.getElementById('pageTransition');
+    if (!overlay) return;
+    const hide = () => overlay.classList.remove('show');
+    const fallback = setTimeout(hide, 3000);
+    document.addEventListener('click', event => {
+      const link = event.target instanceof Element ? event.target.closest('a[href]') : null;
+      if (!link || link.hasAttribute('download') || link.target === '_blank') return;
+      const raw = link.getAttribute('href') || '';
+      if (!raw || raw.startsWith('#') || raw.startsWith('mailto:') || raw.startsWith('tel:')) return;
+      let target;
+      try { target = new URL(raw, window.location.href); } catch (_) { return; }
+      if (target.origin !== window.location.origin) return;
+      if (target.pathname === window.location.pathname && target.search === window.location.search) return;
+      clearTimeout(fallback);
+      overlay.classList.add('show');
+    }, { passive: true });
+    window.addEventListener('pageshow', hide);
+    window.addEventListener('pagehide', hide);
+  })();
+
+  // Keep a focused field visible above the on-screen keyboard on touch devices.
+  (function initMobileKeyboardScroll() {
+    const touchDevice = (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ||
+      (navigator.maxTouchPoints || 0) > 0;
+    if (!touchDevice) return;
+    const selector = 'input:not([type="hidden"]), textarea, select, [contenteditable="true"]';
+    let lastScroll = 0;
+    const reveal = element => {
+      if (!element || !element.isConnected) return;
+      const viewport = window.visualViewport;
+      const height = viewport ? viewport.height : window.innerHeight;
+      const box = element.getBoundingClientRect();
+      if (box.bottom > height - 12 || box.top < 12) {
+        const now = Date.now();
+        if (now - lastScroll < 350) return;
+        lastScroll = now;
+        element.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+    };
+    document.addEventListener('focusin', event => {
+      const field = event.target instanceof Element ? event.target.closest(selector) : null;
+      if (!field) return;
+      setTimeout(() => reveal(field), 320);
+    }, { passive: true });
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', () => {
+        const active = document.activeElement;
+        if (active && active.matches && active.matches(selector)) reveal(active);
+      });
+    }
+  })();
 })();
 </script>
 <script>
@@ -10329,17 +11618,24 @@ html { scroll-behavior: smooth; }
     };
 
     const loadSaved = async () => {
+      if (savedBox) {
+        savedBox.innerHTML = '<div class="skeleton-block">' +
+          '<div class="skeleton skeleton-mini-row"></div>'.repeat(3) + '</div>';
+      }
       try {
         const data = await requestJson('/api/study/sets', { cache: 'no-store' });
         savedSets = Array.isArray(data) ? data : [];
         renderSaved();
       } catch (_) {
-        if (savedBox) savedBox.innerHTML = '<div class="empty-state" style="padding:16px;"><p>Could not load saved study sets.</p></div>';
+        if (savedBox) savedBox.innerHTML = '<div class="empty-state compact"><p>Could not load saved study sets.</p></div>';
+        toast('Could not load saved study sets.', 'error', 5000);
       }
     };
 
     const loadSources = async () => {
       if (!sourceSelect) return;
+      sourceSelect.disabled = true;
+      sourceSelect.innerHTML = '<option value="">Loading your documents…</option>';
       try {
         const data = await requestJson('/api/documents', { cache: 'no-store' });
         const docs = Array.isArray(data) ? data : [];
@@ -10347,7 +11643,10 @@ html { scroll-behavior: smooth; }
           `<option value="${escapeHtml(doc.id)}">${escapeHtml(doc.name || 'Untitled document')}</option>`
         ).join('');
       } catch (_) {
-        sourceSelect.innerHTML = '<option value="">Paste notes below</option>';
+        sourceSelect.innerHTML = '<option value="">Could not load documents — paste notes instead</option>';
+        toast('Could not load your documents for AI Study.', 'error', 5000);
+      } finally {
+        sourceSelect.disabled = false;
       }
     };
 
@@ -10396,7 +11695,7 @@ html { scroll-behavior: smooth; }
           toast(error.message || 'Study generation failed. Please retry.', 'error', 7000);
         } finally {
           generateBtn.disabled = false;
-          generateBtn.innerHTML = '<span aria-hidden="true">✧</span> Generate study material';
+          generateBtn.innerHTML = '<svg class="btn-ico" aria-hidden="true"><use href="#icon-spark"></use></svg> Generate study material';
         }
       });
     }
@@ -10494,6 +11793,266 @@ html { scroll-behavior: smooth; }
             button.disabled = false;
             toast(error.message || 'Could not delete the study set.', 'error', 6000);
           }
+        }
+      });
+    }
+
+
+    // ---- Pro tools: Chat with Notes + Flashcard Mode (Advanced mode) ----
+    const chatToggle = document.getElementById('chatNotesToggle');
+    const chatPanelEl = document.getElementById('chatNotesPanel');
+    const chatLog = document.getElementById('chatLog');
+    const chatForm = document.getElementById('chatForm');
+    const chatInput = document.getElementById('chatInput');
+    const chatSendBtn = document.getElementById('chatSendBtn');
+    const chatStatusEl = document.getElementById('chatStatus');
+    const chatHistory = [];
+
+    const scrollChat = () => { if (chatLog) chatLog.scrollTop = chatLog.scrollHeight; };
+
+    const appendChatBubble = (role, html) => {
+      if (!chatLog) return null;
+      const empty = chatLog.querySelector('.chat-empty');
+      if (empty) empty.remove();
+      const row = document.createElement('div');
+      row.className = 'chat-msg chat-msg-' + role;
+      row.innerHTML = '<div class="chat-bubble">' + html + '</div>';
+      chatLog.appendChild(row);
+      scrollChat();
+      return row;
+    };
+
+    const openChatPanel = () => {
+      if (!chatPanelEl) return;
+      chatPanelEl.removeAttribute('hidden');
+      if (chatToggle) {
+        chatToggle.classList.add('is-open');
+        chatToggle.setAttribute('aria-expanded', 'true');
+      }
+    };
+
+    if (chatToggle && chatPanelEl) {
+      chatToggle.addEventListener('click', () => {
+        if (chatPanelEl.hasAttribute('hidden')) {
+          openChatPanel();
+          if (chatInput) chatInput.focus();
+        } else {
+          chatPanelEl.setAttribute('hidden', '');
+          chatToggle.classList.remove('is-open');
+          chatToggle.setAttribute('aria-expanded', 'false');
+        }
+      });
+    }
+
+    const askChat = async (question) => {
+      const q = String(question || '').trim();
+      if (!q) return;
+      openChatPanel();
+      if (chatInput) chatInput.disabled = true;
+      if (chatSendBtn) chatSendBtn.disabled = true;
+      appendChatBubble('user', escapeHtml(q));
+      const typing = appendChatBubble('ai', '<span class="chat-typing"><i></i><i></i><i></i></span>');
+      if (chatStatusEl) chatStatusEl.textContent = 'Thinking with your notes…';
+      try {
+        const data = await requestJson('/api/study/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question: q,
+            document_id: sourceSelect ? sourceSelect.value : '',
+            text: text ? text.value.trim() : '',
+            language: language ? language.value : 'English',
+            history: chatHistory.slice(-8),
+          }),
+        });
+        chatHistory.push({ role: 'user', content: q });
+        chatHistory.push({ role: 'assistant', content: data.answer || '' });
+        if (chatHistory.length > 16) chatHistory.splice(0, chatHistory.length - 16);
+        if (typing) {
+          const bubble = typing.querySelector('.chat-bubble');
+          if (bubble) bubble.innerHTML = escapeHtml(data.answer || 'No answer returned.').replace(/\n/g, '<br>');
+        }
+        if (chatStatusEl) {
+          chatStatusEl.textContent = data.source_name
+            ? ('Grounded in ' + data.source_name)
+            : 'Answered from your notes.';
+        }
+      } catch (error) {
+        if (typing) {
+          const bubble = typing.querySelector('.chat-bubble');
+          if (bubble) bubble.innerHTML = '<span class="chat-error">' + escapeHtml(error.message || 'Could not answer. Please retry.') + '</span>';
+        }
+        if (chatStatusEl) chatStatusEl.textContent = '';
+      } finally {
+        if (chatInput) chatInput.disabled = false;
+        if (chatSendBtn) chatSendBtn.disabled = false;
+      }
+      scrollChat();
+    };
+
+    if (chatForm) {
+      chatForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const value = chatInput ? chatInput.value : '';
+        if (chatInput) chatInput.value = '';
+        askChat(value);
+      });
+    }
+    studyPanel.querySelectorAll('[data-chat-suggestion]').forEach((button) => {
+      button.addEventListener('click', () => askChat(button.getAttribute('data-chat-suggestion')));
+    });
+
+    // ---- Flashcard Mode ----
+    const flashToggle = document.getElementById('flashcardModeToggle');
+    const flashPanelEl = document.getElementById('flashcardPanel');
+    const fcCard = document.getElementById('fcCard');
+    const fcQuestion = document.getElementById('fcQuestion');
+    const fcAnswer = document.getElementById('fcAnswer');
+    const fcProgress = document.getElementById('fcProgress');
+    const fcBar = document.getElementById('fcBar');
+    const fcGenerateBtn = document.getElementById('fcGenerateBtn');
+    const fcPrevBtn = document.getElementById('fcPrevBtn');
+    const fcNextBtn = document.getElementById('fcNextBtn');
+    const fcFlipBtn = document.getElementById('fcFlipBtn');
+    const fcStatusEl = document.getElementById('fcStatus');
+    let fcCards = [];
+    let fcIndex = 0;
+    let fcFlipped = false;
+
+    const parseFlashcards = (raw) => {
+      const source = String(raw || '').replace(/\r/g, '');
+      const qRe = /^\s*(?:[-*•]\s*)?(?:\d+[.)]\s*)?(?:#{1,6}\s*)?(?:\*\*)?(?:Q(?:uestion)?|Front|Prompt)\s*\d*\s*(?:\*\*)?\s*[:\-–.]\s*(.*)$/i;
+      const aRe = /^\s*(?:[-*•]\s*)?(?:\d+[.)]\s*)?(?:#{1,6}\s*)?(?:\*\*)?(?:A(?:nswer)?|Back)\s*\d*\s*(?:\*\*)?\s*[:\-–.]\s*(.*)$/i;
+      const cards = [];
+      let current = null;
+      let mode = null;
+      const stripMd = (value) => String(value || '').replace(/\*\*/g, '').replace(/\s+/g, ' ').trim();
+      const pushCard = () => {
+        if (!current) return;
+        const q = stripMd(current.q);
+        const a = stripMd(current.a);
+        if (q && a) cards.push({ q, a });
+        current = null;
+      };
+      source.split('\n').forEach((line) => {
+        const qm = line.match(qRe);
+        const am = line.match(aRe);
+        if (qm) { pushCard(); current = { q: qm[1] || '', a: '' }; mode = 'q'; return; }
+        if (am && current) { current.a = am[1] || ''; mode = 'a'; return; }
+        if (!current) return;
+        const clean = line.replace(/^\s*[-*•]\s*/, '').replace(/^#{1,6}\s*/, '').trim();
+        if (!clean) return;
+        if (mode === 'q') current.q = (current.q ? current.q + ' ' : '') + clean;
+        else current.a = (current.a ? current.a + ' ' : '') + clean;
+      });
+      pushCard();
+      if (cards.length) return cards;
+      return source.split(/\n\s*\n/).map((block) => {
+        const cleaned = block.replace(/^#{1,6}\s*/gm, '').replace(/^\s*(?:\d+[.)]|[-*•])\s*/, '').trim();
+        if (!cleaned) return null;
+        const parts = cleaned.split('\n').map((line) => line.trim()).filter(Boolean);
+        if (parts.length < 2) return null;
+        return { q: parts[0].replace(/\*\*/g, '').trim(), a: parts.slice(1).join(' ').replace(/\*\*/g, '').trim() };
+      }).filter(Boolean);
+    };
+
+    const renderFlashcard = () => {
+      if (!fcCard) return;
+      fcCard.classList.remove('flipped');
+      fcFlipped = false;
+      if (!fcCards.length) {
+        if (fcQuestion) fcQuestion.textContent = 'Generate a deck to start.';
+        if (fcAnswer) fcAnswer.textContent = 'Your answer will appear here.';
+        if (fcProgress) fcProgress.textContent = '0 / 0';
+        if (fcBar) fcBar.style.width = '0%';
+        return;
+      }
+      const card = fcCards[fcIndex];
+      if (fcQuestion) fcQuestion.textContent = card.q;
+      if (fcAnswer) fcAnswer.textContent = card.a;
+      if (fcProgress) fcProgress.textContent = (fcIndex + 1) + ' / ' + fcCards.length;
+      if (fcBar) fcBar.style.width = (((fcIndex + 1) / fcCards.length) * 100) + '%';
+    };
+
+    const flipFlashcard = () => {
+      if (!fcCard || !fcCards.length) return;
+      fcFlipped = !fcFlipped;
+      fcCard.classList.toggle('flipped', fcFlipped);
+    };
+
+    const moveFlashcard = (delta) => {
+      if (!fcCards.length) return;
+      fcIndex = (fcIndex + delta + fcCards.length) % fcCards.length;
+      renderFlashcard();
+    };
+
+    if (flashToggle && flashPanelEl) {
+      flashToggle.addEventListener('click', () => {
+        if (flashPanelEl.hasAttribute('hidden')) {
+          flashPanelEl.removeAttribute('hidden');
+          flashToggle.classList.add('is-open');
+          flashToggle.setAttribute('aria-expanded', 'true');
+        } else {
+          flashPanelEl.setAttribute('hidden', '');
+          flashToggle.classList.remove('is-open');
+          flashToggle.setAttribute('aria-expanded', 'false');
+        }
+      });
+    }
+
+    if (fcCard) {
+      fcCard.addEventListener('click', flipFlashcard);
+      fcCard.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); flipFlashcard(); }
+        else if (event.key === 'ArrowRight') { event.preventDefault(); moveFlashcard(1); }
+        else if (event.key === 'ArrowLeft') { event.preventDefault(); moveFlashcard(-1); }
+      });
+    }
+    if (fcFlipBtn) fcFlipBtn.addEventListener('click', flipFlashcard);
+    if (fcPrevBtn) fcPrevBtn.addEventListener('click', () => moveFlashcard(-1));
+    if (fcNextBtn) fcNextBtn.addEventListener('click', () => moveFlashcard(1));
+
+    if (fcGenerateBtn) {
+      fcGenerateBtn.addEventListener('click', async () => {
+        const documentId = sourceSelect ? sourceSelect.value : '';
+        const notes = text ? text.value.trim() : '';
+        if (!documentId && !notes) {
+          toast('Choose a document or paste some notes first.', 'warning');
+          if (fcStatusEl) fcStatusEl.textContent = 'Choose a document or paste some notes first.';
+          return;
+        }
+        fcGenerateBtn.disabled = true;
+        fcGenerateBtn.textContent = 'Building deck…';
+        if (fcStatusEl) fcStatusEl.textContent = 'Generating flashcards from your notes…';
+        try {
+          const data = await requestJson('/api/study/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'flashcards',
+              document_id: documentId,
+              text: notes,
+              language: language ? language.value : 'English',
+              count: count ? count.value : 8,
+              prompt: prompt ? prompt.value : '',
+              save: false,
+            }),
+          });
+          fcCards = parseFlashcards(data.result);
+          fcIndex = 0;
+          renderFlashcard();
+          if (fcStatusEl) {
+            fcStatusEl.textContent = fcCards.length
+              ? ('Deck ready — ' + fcCards.length + ' cards. Click a card to flip.')
+              : 'Could not read the cards. Please generate again.';
+          }
+          if (!fcCards.length) toast('No flashcards could be read. Please retry.', 'warning');
+        } catch (error) {
+          if (fcStatusEl) fcStatusEl.textContent = error.message || 'Could not generate flashcards.';
+          toast(error.message || 'Could not generate flashcards.', 'error', 6000);
+        } finally {
+          fcGenerateBtn.disabled = false;
+          fcGenerateBtn.innerHTML = '<svg class="btn-ico" aria-hidden="true"><use href="#icon-cards"></use></svg> Generate deck';
         }
       });
     }
@@ -10607,7 +12166,16 @@ html { scroll-behavior: smooth; }
     };
 
     const loadAdmin = async () => {
-      setText('adminDocs', '…');
+      const adminSkeleton = (count) => '<div class="skeleton-block">' +
+        '<div class="skeleton admin-skeleton-row"></div>'.repeat(count) + '</div>';
+      ['adminSystem', 'adminFailedList', 'adminActivity', 'adminPlan', 'adminPayments'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = adminSkeleton(4);
+      });
+      ['adminDocs', 'adminStorage', 'adminFailed', 'adminStudySets'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = '<span class="skeleton skeleton-stat" aria-hidden="true"></span>';
+      });
       try {
         const data = await requestJson('/api/admin/overview', { cache: 'no-store', headers: adminHeaders() });
         renderAdmin(data);
@@ -10764,6 +12332,332 @@ html { scroll-behavior: smooth; }
     showToast('You are offline. Some features may be unavailable.', 'warning', 5000);
   });
 </script>
+
+    <script>
+    // Study Mode Toggle with localStorage persistence
+    document.addEventListener('DOMContentLoaded', function() {
+        const savedMode = localStorage.getItem('notesaiStudyMode');
+        const modeSimple = document.getElementById('modeSimple');
+        const modeAdvanced = document.getElementById('modeAdvanced');
+        const studyActionsContainer = document.getElementById('studyActions');
+        if (!modeSimple || !modeAdvanced || !studyActionsContainer) return;
+        
+        if (!savedMode) {
+            localStorage.setItem('notesaiStudyMode', 'simple');
+        }
+        
+        const currentMode = localStorage.getItem('notesaiStudyMode');
+        setMode(currentMode);
+        
+        modeSimple.addEventListener('click', function() {
+            setMode('simple');
+            localStorage.setItem('notesaiStudyMode', 'simple');
+        });
+        
+        modeAdvanced.addEventListener('click', function() {
+            setMode('advanced');
+            localStorage.setItem('notesaiStudyMode', 'advanced');
+        });
+        
+        function setMode(mode) {
+            const chips = studyActionsContainer.querySelectorAll('.study-chip');
+            chips.forEach(chip => {
+                chip.classList.remove('active');
+            });
+            
+            const actionMap = {
+                'simple': ['summarize', 'key_points', 'qa', 'flashcards'],
+                'advanced': ['summarize', 'rewrite', 'translate', 'key_points', 'headings', 'organize', 'qa', 'mcq', 'short_questions', 'long_questions', 'flashcards', 'quiz', 'exam_topics', 'chapter_summary', 'explain', 'revision']
+            };
+            
+            chips.forEach(chip => {
+                const action = chip.getAttribute('data-action');
+                if (actionMap[mode].includes(action)) {
+                    chip.classList.add('active');
+                }
+            });
+            
+            const studyPanelEl = document.getElementById('studyPanel');
+            const modeHintEl = document.getElementById('studyModeHint');
+            if (mode === 'simple') {
+                if (studyPanelEl) { studyPanelEl.classList.add('simple-mode-active'); }
+                if (modeHintEl) { modeHintEl.textContent = 'Simple: 4 actions'; }
+                modeSimple.classList.add('active');
+                modeAdvanced.classList.remove('active');
+            } else {
+                if (studyPanelEl) { studyPanelEl.classList.remove('simple-mode-active'); }
+                if (modeHintEl) { modeHintEl.textContent = 'Advanced: 15 actions + diagrams'; }
+                modeAdvanced.classList.add('active');
+                modeSimple.classList.remove('active');
+            }
+        }
+    });
+    </script>
+<script>
+  // Topbar interactions - premium polish
+  const topbarSearchInput = document.getElementById('topbarSearchInput');
+  if (topbarSearchInput) {
+    topbarSearchInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        const q = topbarSearchInput.value.trim();
+        window.location.href = q ? '/search?q=' + encodeURIComponent(q) : '/search';
+      }
+    });
+  }
+  const notifBtn = document.getElementById('notifBtn');
+  const notifMenu = document.getElementById('notifMenu');
+  const accountMenu = document.getElementById('accountMenu');
+  const userAvatar = document.getElementById('userAvatar');
+  const topbarLogoutBtn = document.getElementById('topbarLogoutBtn');
+  function closeTopbarMenus() {
+    if (notifMenu) { notifMenu.classList.remove('show'); notifMenu.setAttribute('aria-hidden', 'true'); }
+    if (accountMenu) { accountMenu.classList.remove('show'); accountMenu.setAttribute('aria-hidden', 'true'); }
+    if (notifBtn) { notifBtn.setAttribute('aria-expanded', 'false'); }
+  }
+  function openNotifMenu() {
+    if (notifMenu) { notifMenu.classList.add('show'); notifMenu.setAttribute('aria-hidden', 'false'); }
+    if (accountMenu) { accountMenu.classList.remove('show'); accountMenu.setAttribute('aria-hidden', 'true'); }
+    if (notifBtn) { notifBtn.setAttribute('aria-expanded', 'true'); }
+  }
+  function openAccountMenu() {
+    if (accountMenu) { accountMenu.classList.add('show'); accountMenu.setAttribute('aria-hidden', 'false'); }
+    if (notifMenu) { notifMenu.classList.remove('show'); notifMenu.setAttribute('aria-hidden', 'true'); }
+    if (notifBtn) { notifBtn.setAttribute('aria-expanded', 'false'); }
+  }
+  if (notifBtn && notifMenu) {
+    notifBtn.addEventListener('click', function (e) { e.stopPropagation(); if (notifMenu.classList.contains('show')) { closeTopbarMenus(); } else { openNotifMenu(); loadNotifications(); } });
+  }
+  if (userAvatar && accountMenu) {
+    userAvatar.addEventListener('click', function (e) { e.stopPropagation(); if (accountMenu.classList.contains('show')) { closeTopbarMenus(); } else { openAccountMenu(); } });
+  }
+  document.addEventListener('click', function (e) {
+    const t = e.target;
+    const notifOpen = notifMenu ? notifMenu.classList.contains('show') : false;
+    const accountOpen = accountMenu ? accountMenu.classList.contains('show') : false;
+    const inNotif = notifMenu ? notifMenu.contains(t) : false;
+    const inAccount = accountMenu ? accountMenu.contains(t) : false;
+    const onNotifBtn = notifBtn ? (t === notifBtn) : false;
+    const onAvatar = userAvatar ? (t === userAvatar) : false;
+    if (!inNotif && !onNotifBtn && !inAccount && !onAvatar) { closeTopbarMenus(); }
+  });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeTopbarMenus(); } });
+  if (topbarLogoutBtn) {
+    topbarLogoutBtn.addEventListener('click', function (e) { e.preventDefault(); fetch('/api/auth/logout', { method: 'POST' }).catch(function () {}).finally(function () { window.location.href = '/'; }); });
+  }
+
+  /* ---- Real notifications ---- */
+  const notifList = document.getElementById('notifList');
+  const notifCount = document.getElementById('notifCount');
+  const notifDot = document.getElementById('notifDot');
+  const notifMarkRead = document.getElementById('notifMarkRead');
+  let notifLoaded = false;
+  let notifSignature = '';
+
+  function notifEscape(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+    });
+  }
+
+  function notifTimeAgo(iso) {
+    const then = new Date(iso).getTime();
+    if (!then || isNaN(then)) return '';
+    const diff = Math.max(0, Date.now() - then);
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'Just now';
+    if (mins < 60) return mins + 'm ago';
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + 'h ago';
+    const days = Math.floor(hours / 24);
+    if (days < 7) return days + 'd ago';
+    return new Date(then).toLocaleDateString();
+  }
+
+  const NOTIF_ICONS = { success: 'icon-check', error: 'icon-alert', info: 'icon-bell' };
+
+  function notifEmptyHtml() {
+    return '<div class="notif-empty">' +
+      '<span class="notif-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-check"></use></svg></span>' +
+      '<strong>You\'re all caught up!</strong>' +
+      '<p>We\'ll notify you when your PDFs are ready.</p>' +
+      '</div>';
+  }
+
+  function renderNotifications(data) {
+    if (!notifList) return;
+    const items = Array.isArray(data && data.notifications) ? data.notifications : [];
+    const unread = Number((data && data.unread) || 0);
+    if (notifDot) notifDot.hidden = unread <= 0;
+    if (notifCount) {
+      notifCount.hidden = unread <= 0;
+      notifCount.textContent = unread > 99 ? '99+' : String(unread);
+    }
+    if (notifMarkRead) notifMarkRead.disabled = unread <= 0;
+    if (!items.length) {
+      notifList.innerHTML = notifEmptyHtml();
+      return;
+    }
+    notifList.innerHTML = items.map(function (item) {
+      const kind = (item.kind === 'success' || item.kind === 'error') ? item.kind : 'info';
+      const iconId = NOTIF_ICONS[kind];
+      return '<div class="notif-item' + (item.read ? '' : ' is-unread') + '" role="menuitem">' +
+        '<span class="notif-item-icon is-' + kind + '" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#' + iconId + '"></use></svg></span>' +
+        '<div class="notif-item-body"><strong>' + notifEscape(item.title) + '</strong>' +
+        '<p>' + notifEscape(item.detail || 'Workspace activity') + '</p>' +
+        '<span class="notif-item-time">' + notifEscape(notifTimeAgo(item.timestamp)) + '</span></div>' +
+        (item.read ? '' : '<span class="notif-unread-dot" aria-label="Unread"></span>') +
+        '</div>';
+    }).join('');
+  }
+
+  async function loadNotifications() {
+    if (!notifBtn) return;
+    if (!notifLoaded && notifList) {
+      notifList.innerHTML = '<div class="skeleton-block">' +
+        '<div class="skeleton notif-skeleton-row"></div>'.repeat(3) +
+        '</div>';
+    }
+    try {
+      const res = await fetch('/api/notifications', { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const signature = JSON.stringify({ items: data.notifications, unread: data.unread });
+      notifLoaded = true;
+      // Polling should not flicker the dropdown or jump its scroll position.
+      if (signature !== notifSignature) {
+        notifSignature = signature;
+        renderNotifications(data);
+      }
+    } catch (_) {
+      if (notifList && !notifLoaded) {
+        notifList.innerHTML = '<div class="notif-empty"><strong>Could not load notifications</strong><p>Please try again in a moment.</p></div>';
+      }
+    }
+  }
+
+  if (notifMarkRead) {
+    notifMarkRead.addEventListener('click', async function () {
+      notifMarkRead.disabled = true;
+      try {
+        await fetch('/api/notifications/read', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      } catch (_) {}
+      loadNotifications();
+    });
+  }
+
+  if (notifBtn) {
+    loadNotifications();
+    setInterval(function () { if (!document.hidden) loadNotifications(); }, 45000);
+    window.addEventListener('focus', loadNotifications);
+  }
+</script>
+<script>
+(function () {
+  /* ---- Global search page ---- */
+  const searchInput = document.getElementById('globalSearchInput');
+  const searchResults = document.getElementById('searchResults');
+  if (searchInput && searchResults) {
+    let documents = [];
+    let loaded = false;
+    let loading = false;
+    let searchFailed = false;
+    const escapeHtml = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+    const formatSize = (bytes) => {
+      const value = Number(bytes) || 0;
+      if (!value) return '';
+      if (value < 1048576) return (value / 1024).toFixed(1) + ' KB';
+      return (value / 1048576).toFixed(2) + ' MB';
+    };
+    const emptyState = (title, text) => {
+      searchResults.innerHTML = '<div class="empty-state"><div class="empty-state-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg></div><h4>' + escapeHtml(title) + '</h4><p>' + escapeHtml(text) + '</p></div>';
+    };
+    const searchSkeleton = () => {
+      searchResults.innerHTML = '<div class="search-skeleton-list" aria-hidden="true">' +
+        '<div class="skeleton search-skeleton-row"></div>'.repeat(4) + '</div>' +
+        '<span class="visually-hidden">Searching your documents. Please wait a moment.</span>';
+    };
+    const errorState = (title, text) => {
+      searchResults.innerHTML = '<div class="empty-state enhanced">' +
+        '<div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-alert"></use></svg></div>' +
+        '<h4>' + escapeHtml(title) + '</h4><p>' + escapeHtml(text) + '</p>' +
+        '<button type="button" class="btn-3d btn-primary" id="searchRetry">Retry</button></div>';
+      const retry = document.getElementById('searchRetry');
+      if (retry) retry.addEventListener('click', () => {
+        loaded = false;
+        searchFailed = false;
+        loadSearch();
+      });
+    };
+    const renderSearch = () => {
+      const query = searchInput.value.trim();
+      const needle = query.toLowerCase();
+      if (!needle) { emptyState('Start typing to search', 'Results from your documents will appear here.'); return; }
+      if (loading || !loaded) { searchSkeleton(); return; }
+      if (searchFailed) { errorState('Could not load your documents', 'Check your connection and try again.'); return; }
+      const matches = documents.filter((doc) => {
+        const tags = Array.isArray(doc.tags) ? doc.tags.join(' ') : '';
+        return [doc.name, doc.folder, doc.category, tags, doc.status].join(' ').toLowerCase().indexOf(needle) !== -1;
+      });
+      if (!matches.length) { emptyState('No results for "' + query + '"', 'Try a different keyword, folder or tag.'); return; }
+      searchResults.innerHTML = '<div class="search-result-list">' + matches.slice(0, 60).map((doc) => {
+        const meta = [doc.folder, formatSize(doc.size), doc.status || 'ready'].filter(Boolean).map(escapeHtml).join(' · ');
+        return '<a class="search-result" href="/my-notes"><span class="search-result-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-notes"></use></svg></span><span class="search-result-body"><strong>' + escapeHtml(doc.name || 'Untitled document') + '</strong><small>' + meta + '</small></span><span class="search-result-arrow" aria-hidden="true">→</span></a>';
+      }).join('') + '</div>';
+    };
+    const loadSearch = () => {
+      if (loaded || loading) return;
+      loading = true;
+      searchFailed = false;
+      renderSearch();
+      fetch('/api/documents', { cache: 'no-store' })
+        .then((res) => { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+        .then((data) => { documents = (Array.isArray(data) ? data : []).filter((doc) => !doc.deleted_at); loaded = true; })
+        .catch(() => { searchFailed = true; })
+        .then(() => { loading = false; renderSearch(); });
+    };
+    const params = new URLSearchParams(window.location.search);
+    const initialQuery = params.get('q');
+    if (initialQuery) searchInput.value = initialQuery;
+    let debounce = null;
+    searchInput.addEventListener('input', () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(renderSearch, 120);
+      if (!loaded) loadSearch();
+    });
+    if (initialQuery) loadSearch();
+  }
+
+  /* ---- Subscription plan actions ---- */
+  const planActionStatus = document.getElementById('planActionStatus');
+  document.querySelectorAll('.plan-action-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const plan = btn.getAttribute('data-plan-action');
+      if (planActionStatus) {
+        planActionStatus.textContent = plan === 'pro'
+          ? 'Professional upgrade requested. Your workspace admin will activate it — no online payment is taken here.'
+          : 'You will remain on the Free plan. No changes were made.';
+      }
+    });
+  });
+})();
+</script>
+<script>
+(function () {
+  const btn = document.getElementById('helpCopyEmail');
+  if (!btn) return;
+  const email = btn.getAttribute('data-email') || '';
+  const original = btn.textContent;
+  btn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(email);
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = original; }, 1600);
+    } catch (_) {
+      window.location.href = 'mailto:' + email;
+    }
+  });
+})();
+</script>
 </body>
 </html>
 """
@@ -10915,6 +12809,70 @@ def api_stats_reset():
 def api_activity():
     return jsonify(load_activity())
 
+
+NOTIFICATION_TITLES = {
+    "Generate PDF": ("PDF generation complete", "success"),
+    "Extract": ("Text extraction finished", "success"),
+    "Upload": ("Files uploaded", "info"),
+    "Download": ("PDF downloaded", "info"),
+    "Create Order": ("New order created", "info"),
+    "Study": ("Study material ready", "success"),
+    "Settings": ("Workspace updated", "info"),
+    "Billing": ("Plan updated", "info"),
+}
+
+
+@app.route("/api/notifications")
+@require_user_or_admin
+def api_notifications():
+    state = load_notification_state()
+    read_at = str(state.get("read_at") or "")
+    notifications = []
+    for entry in load_activity()[:30]:
+        action = str(entry.get("action") or "Activity").strip() or "Activity"
+        detail = str(entry.get("detail") or "").strip()
+        status = str(entry.get("status") or "completed").lower()
+        timestamp = str(entry.get("timestamp") or "")
+        title, kind = NOTIFICATION_TITLES.get(action, (action, "info"))
+        if status == "failed":
+            title = "PDF generation failed" if action in ("Generate PDF", "Extract") else f"{action} failed"
+            kind = "error"
+        elif status in ("pending", "processing"):
+            title = f"{action} in progress"
+            kind = "info"
+        notifications.append({
+            "id": f"{action}:{timestamp}",
+            "action": action,
+            "title": title,
+            "detail": detail,
+            "status": status,
+            "kind": kind,
+            "timestamp": timestamp,
+            "read": _notification_is_read(timestamp, read_at),
+        })
+    # First visit: baseline existing history as read so the badge only counts
+    # genuinely new events. The full history stays visible in the dropdown.
+    if not read_at and notifications:
+        read_at = datetime.now().isoformat()
+        state["read_at"] = read_at
+        try:
+            save_notification_state(state)
+        except Exception:
+            pass
+        for item in notifications:
+            item["read"] = True
+    unread = sum(1 for item in notifications if not item["read"])
+    return jsonify({"notifications": notifications, "unread": unread, "read_at": read_at})
+
+
+@app.route("/api/notifications/read", methods=["POST"])
+@require_user_or_admin
+def api_notifications_read():
+    state = load_notification_state()
+    state["read_at"] = datetime.now().isoformat()
+    save_notification_state(state)
+    return jsonify({"ok": True, "read_at": state["read_at"]})
+
 @app.route("/api/activity/clear", methods=["POST"])
 def api_activity_clear():
     denied = require_admin()
@@ -10997,6 +12955,59 @@ def api_study_generate():
         "source_document_id": (source_document or {}).get("id") or "",
         "source_name": (source_document or {}).get("name") or "",
         "saved": saved,
+        "truncated": truncated,
+    })
+
+
+@app.route("/api/study/chat", methods=["POST"])
+@require_user_or_admin
+@security.rate_limit("api_ai")
+def api_study_chat():
+    payload = request.get_json(silent=True) or request.form
+    question = str(payload.get("question") or "").strip()[:1200]
+    if not question:
+        return _error_response("Ask a question about your notes.", 400, "STUDY_QUESTION_REQUIRED", retryable=False)
+    document_id = str(payload.get("document_id") or "").strip()
+    source_document = None
+    text = str(payload.get("text") or "").strip()
+    if document_id:
+        source_document = get_document(document_id)
+        if not source_document:
+            return _error_response("The selected document was not found.", 404, "DOCUMENT_NOT_FOUND", retryable=False)
+        text = _document_text_for_study(source_document) or text
+    if not text:
+        return _error_response("Choose a document or paste some notes first.", 400, "STUDY_TEXT_REQUIRED", retryable=False)
+    truncated = len(text) > 30000
+    if truncated:
+        text = text[:30000]
+    language = str(payload.get("language") or "English").strip()[:60]
+    history_lines = []
+    history = payload.get("history") or []
+    if isinstance(history, list):
+        for item in history[-8:]:
+            if not isinstance(item, dict):
+                continue
+            role = "Student" if str(item.get("role")) == "user" else "Assistant"
+            content = str(item.get("content") or "").strip()[:1200]
+            if content:
+                history_lines.append(f"{role}: {content}")
+    prompt = (
+        "You are NotesAI Chat, a study tutor. Answer only from the supplied notes. "
+        "If the answer is not present in the notes, say so clearly and suggest what to review. "
+        "Be concise and use short paragraphs or bullets. "
+        f"Answer in {language}.\n\n"
+        + (("CONVERSATION SO FAR:\n" + "\n".join(history_lines) + "\n\n") if history_lines else "")
+        + f"QUESTION:\n{question}\n\nNOTES:\n{text}"
+    )
+    answer, provider, model, status, error = generate_text_with_provider(prompt)
+    if status != 200:
+        return _ai_failure_response(status, error, provider, model, code="STUDY_CHAT_FAILED")
+    return jsonify({
+        "ok": True,
+        "answer": answer,
+        "provider": provider,
+        "model": model,
+        "source_name": (source_document or {}).get("name") or "",
         "truncated": truncated,
     })
 
@@ -11140,7 +13151,7 @@ def api_admin_backup():
         return denied
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in (DOCUMENTS_FILE, ACTIVITY_FILE, STATS_FILE, STUDY_SETS_FILE, BILLING_FILE):
+        for path in (DOCUMENTS_FILE, ACTIVITY_FILE, STATS_FILE, STUDY_SETS_FILE, BILLING_FILE, NOTIFICATIONS_FILE):
             if path.is_file():
                 archive.write(path, arcname=path.name)
         for path in sorted(DOCUMENTS_DIR.glob("*.pdf")):
@@ -12355,7 +14366,10 @@ def pwa_offline():
 def home():
     stats = load_stats()
     activity = load_activity()[:5]
-    return render_template_string(HTML, page='dashboard', page_title='Dashboard', page_desc='', stats=stats, activity=activity, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'))
+    user = get_current_user()
+    user_name = user.get('name', 'User') if user else 'Guest'
+    user_initial = user_name[0].upper() if user_name else 'G'
+    return render_template_string(HTML, page='dashboard', page_title='Dashboard', page_desc='', stats=stats, activity=activity, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'), user_name=user_name, user_initial=user_initial)
 
 @app.route("/health")
 def health():
@@ -12369,6 +14383,11 @@ PAGES = {
     "history": ("Order History", "Your previous and completed orders."),
     "settings": ("Workspace Settings", "Manage your NotesAI workspace preferences."),
     "admin": ("Admin Overview", "Local workspace health, storage, billing and failed-job monitoring."),
+    "home": ("Home", "Welcome to your NotesAI premium workspace"),
+    "search": ("Search", "Search across all your documents and study sets"),
+    "trash": ("Trash", "Deleted documents and study sets"),
+    "subscription": ("Subscription", "Manage your subscription and billing"),
+    "help": ("Help & Support", "Answers, guides and a direct line to workspace support."),
 }
 
 @app.route("/<page>")
@@ -12376,7 +14395,10 @@ def navigation_page(page):
     if page not in PAGES:
         abort(404)
     title, description = PAGES[page]
-    return render_template_string(HTML, page=page, page_title=title, page_desc=description, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'))
+    user = get_current_user()
+    user_name = user.get('name', 'User') if user else 'Guest'
+    user_initial = user_name[0].upper() if user_name else 'G'
+    return render_template_string(HTML, page=page, page_title=title, page_desc=description, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'), user_name=user_name, user_initial=user_initial, support_email=os.getenv('NOTESAI_SUPPORT_EMAIL','support@notesai.app'))
 
 if __name__ == "__main__":
     try:
