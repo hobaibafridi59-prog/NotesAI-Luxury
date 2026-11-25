@@ -20,8 +20,8 @@ VENV_DIR="$PROJECT_DIR/venv"
 echo "=== NotesAI PythonAnywhere Deployment ==="
 echo ""
 
-# 1. Verify project directory
-echo "1. Verifying project directory..."
+# 1. Verify and update project directory
+echo "1. Verifying and updating project directory..."
 if [ ! -d "$PROJECT_DIR" ]; then
     echo "   ERROR: Project directory not found: $PROJECT_DIR"
     echo "   Please clone the repository first:"
@@ -29,6 +29,19 @@ if [ ! -d "$PROJECT_DIR" ]; then
     exit 1
 fi
 cd "$PROJECT_DIR"
+
+# Make sure this directory is a git checkout, then move it to latest main.
+if [ ! -d .git ]; then
+    git init -q
+    echo "   Initialized git in existing project directory"
+fi
+if ! git remote get-url origin >/dev/null 2>&1; then
+    git remote add origin https://github.com/hobaibafridi59-prog/NotesAI-Luxury.git
+fi
+echo "   Updating code from origin/main..."
+git fetch origin
+git reset --hard origin/main
+echo "   HEAD: $(git log -1 --oneline)"
 echo "   OK: $PROJECT_DIR"
 echo ""
 
