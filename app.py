@@ -11811,6 +11811,8 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     const resultTitle = document.getElementById('studyResultTitle');
     const copyBtn = document.getElementById('studyCopyBtn');
     const formatBtn = document.getElementById('studyFormatBtn');
+    const mdBtn = document.getElementById('studyDownloadMdBtn');
+    const txtBtn = document.getElementById('studyDownloadTxtBtn');
     const saveBtn = document.getElementById('studySaveBtn');
     const useBtn = document.getElementById('studyUseBtn');
     const savedBox = document.getElementById('studySaved');
