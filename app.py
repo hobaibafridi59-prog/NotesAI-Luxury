@@ -13211,6 +13211,8 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         const studyActionsContainer = document.getElementById('studyActions');
         if (!modeSimple || !modeAdvanced || !studyActionsContainer) return;
         
+        const SIMPLE_ACTIONS = ['summarize', 'key_points', 'qa', 'flashcards'];
+
         if (!savedMode) {
             localStorage.setItem('notesaiStudyMode', 'simple');
         }
@@ -13228,8 +13230,6 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
             localStorage.setItem('notesaiStudyMode', 'advanced');
         });
         
-        const SIMPLE_ACTIONS = ['summarize', 'key_points', 'qa', 'flashcards'];
-
         function setMode(mode) {
             const chips = Array.from(studyActionsContainer.querySelectorAll('.study-chip'));
             const available = chips.map(chip => chip.getAttribute('data-action')).filter(Boolean);
