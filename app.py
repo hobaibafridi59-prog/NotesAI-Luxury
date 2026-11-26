@@ -13205,7 +13205,16 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     <script>
     // Study Mode Toggle with localStorage persistence
     document.addEventListener('DOMContentLoaded', function() {
-        const savedMode = localStorage.getItem('notesaiStudyMode');
+        // Storage can throw in private/blocked-cookie modes. Never let that
+        // stop the mode buttons from being wired up.
+        const readStore = (key, fallback) => {
+            try { return localStorage.getItem(key) || fallback; } catch (_) { return fallback; }
+        };
+        const writeStore = (key, value) => {
+            try { localStorage.setItem(key, value); } catch (_) {}
+        };
+
+        let savedMode = readStore('notesaiStudyMode', '');
         const modeSimple = document.getElementById('modeSimple');
         const modeAdvanced = document.getElementById('modeAdvanced');
         const studyActionsContainer = document.getElementById('studyActions');
@@ -13214,20 +13223,21 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         const SIMPLE_ACTIONS = ['summarize', 'key_points', 'qa', 'flashcards'];
 
         if (!savedMode) {
-            localStorage.setItem('notesaiStudyMode', 'simple');
+            savedMode = 'simple';
+            writeStore('notesaiStudyMode', savedMode);
         }
         
-        const currentMode = localStorage.getItem('notesaiStudyMode');
+        const currentMode = readStore('notesaiStudyMode', savedMode);
         setMode(currentMode);
         
         modeSimple.addEventListener('click', function() {
             setMode('simple');
-            localStorage.setItem('notesaiStudyMode', 'simple');
+            writeStore('notesaiStudyMode', 'simple');
         });
         
         modeAdvanced.addEventListener('click', function() {
             setMode('advanced');
-            localStorage.setItem('notesaiStudyMode', 'advanced');
+            writeStore('notesaiStudyMode', 'advanced');
         });
         
         function setMode(mode) {
