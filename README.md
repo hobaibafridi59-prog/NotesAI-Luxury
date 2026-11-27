@@ -76,6 +76,22 @@ Optional:
 - `NOTESAI_HOST` — Server host (default: 127.0.0.1)
 - `NOTESAI_PORT` — Server port (default: 3000)
 
+### Email validation and verification
+
+Signups reject disposable/temporary email domains and, when `dnspython` is installed, check that the domain has an MX record. Set `NOTESAI_EMAIL_MX_CHECK=0` to skip DNS checks.
+
+OTP verification activates automatically once SMTP is configured with `NOTESAI_SMTP_HOST` and `NOTESAI_SMTP_FROM`. Until then, registration keeps its existing auto-login behavior so deployments without SMTP are not locked out.
+
+- `NOTESAI_SMTP_HOST` — SMTP server host
+- `NOTESAI_SMTP_PORT` — SMTP port (default: `587`)
+- `NOTESAI_SMTP_USER` / `NOTESAI_SMTP_PASSWORD` — SMTP credentials (optional for local relays)
+- `NOTESAI_SMTP_FROM` — Sender address shown to users
+- `NOTESAI_SMTP_STARTTLS` — `1` by default; set `0` for providers without STARTTLS
+- `NOTESAI_SMTP_SSL` — Set `1` for implicit TLS (usually port `465`)
+- `NOTESAI_SMTP_TIMEOUT` — SMTP timeout in seconds (default: `10`)
+
+Endpoints: `POST /api/auth/verify-email` and `POST /api/auth/resend-verification`.
+
 ### Access
 
 Open `http://127.0.0.1:3000` in your browser.

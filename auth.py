@@ -30,6 +30,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # Import database and models
 import database
 import models
+import email_validation
 
 # ============================================================================
 # CONFIGURATION
@@ -494,13 +495,17 @@ def require_user_or_admin(f):
 # AUTHENTICATION FUNCTIONS
 # ============================================================================
 
-def register_user(db, email, password, name):
+def register_user(db, email, password, name, email_verified=True):
     """Register a new user. Returns (user, error_message)."""
     email = email.strip().lower()
     name = name.strip()
 
     if not validate_email(email):
         return None, "Invalid email format."
+
+    real_email, email_error = email_validation.validate_real_email(email)
+    if not real_email:
+        return None, email_error
 
     is_valid, error = validate_password(password)
     if not is_valid:
@@ -516,8 +521,56 @@ def register_user(db, email, password, name):
 
     # Hash password and create user
     password_hash = hash_password(password)
-    user = models.create_user(db, email, password_hash, name, role="user")
+    user = models.create_user(db, email, password_hash, name, role="user",
+                              email_verified=email_verified)
     return user, None
+
+
+def issue_email_verification(db, user):
+    """Create and store a fresh 6-digit OTP. Returns the plain code."""
+    code = email_validation.generate_verification_code()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    models.create_email_verification(
+        db,
+        user["id"],
+        email_validation.hash_verification_code(code, user["email"]),
+        expires_at,
+    )
+    return code
+
+
+def verify_email_code(db, user, code):
+    """Verify an OTP. Returns (ok, error_message)."""
+    code = str(code or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        return False, "Enter the 6-digit verification code."
+
+    record = models.get_latest_email_verification(db, user["id"])
+    if not record or record.get("verified_at"):
+        return False, "This verification code is no longer valid. Request a new one."
+
+    if int(record.get("attempts") or 0) >= 5:
+        return False, "Too many incorrect attempts. Request a new verification code."
+
+    try:
+        expires_at = datetime.fromisoformat(str(record["expires_at"]).replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False, "This verification code is no longer valid. Request a new one."
+
+    if datetime.now(timezone.utc) > expires_at:
+        return False, "This verification code has expired. Request a new one."
+
+    candidate = email_validation.hash_verification_code(code, user["email"])
+    if not hmac.compare_digest(candidate, str(record["code_hash"])):
+        models.increment_email_verification_attempt(db, record["id"])
+        return False, "Incorrect verification code."
+
+    models.mark_email_verification_verified(db, record["id"])
+    models.update_user(db, user["id"], email_verified=1)
+    user["email_verified"] = 1
+    return True, None
 
 
 def login_user(db, email, password):
@@ -533,6 +586,9 @@ def login_user(db, email, password):
 
     if not verify_password(user["password_hash"], password):
         return None, None, None, "Invalid email or password."
+
+    if not user.get("email_verified", 1):
+        return None, None, None, "Please verify your email before signing in."
 
     # Update last login
     models.update_user(db, user["id"], last_login_at=datetime.now(timezone.utc).isoformat())

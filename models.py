@@ -28,7 +28,7 @@ def _validate_email(email):
     import re
     return bool(re.match(r"^[^@]+@[^@]+\.[^@]+$", email))
 
-def create_user(db, email, password_hash, name, role="user"):
+def create_user(db, email, password_hash, name, role="user", email_verified=True):
     """Create a new user. Returns user dict."""
     email = email.lower().strip()
     if not _validate_email(email):
@@ -40,9 +40,9 @@ def create_user(db, email, password_hash, name, role="user"):
     user_id = uuid.uuid4().hex
     now = now_iso()
     db.execute(
-        """INSERT INTO users (id, email, password_hash, name, role, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
-        (user_id, email.lower().strip(), password_hash, name.strip(), role, now, now)
+        """INSERT INTO users (id, email, password_hash, name, role, status, email_verified, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)""",
+        (user_id, email.lower().strip(), password_hash, name.strip(), role, 1 if email_verified else 0, now, now)
     )
     db.commit()
     return get_user_by_id(db, user_id)
@@ -111,14 +111,14 @@ def get_user_stats(db, user_id):
 
 
 def update_user(db, user_id, **fields):
-    """Update user fields. Allowed: name, role, status, last_login_at."""
-    allowed = {"name", "role", "status", "last_login_at", "password_hash"}
+    """Update user fields. Allowed: name, role, status, last_login_at, password_hash, email_verified."""
+    allowed = {"name", "role", "status", "last_login_at", "password_hash", "email_verified"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
     updates["updated_at"] = now_iso()
     # Use allowlist-based column mapping for safety
-    _USER_COLUMNS = {"name", "role", "status", "last_login_at", "updated_at", "password_hash"}
+    _USER_COLUMNS = {"name", "role", "status", "last_login_at", "updated_at", "password_hash", "email_verified"}
     safe_updates = {k: v for k, v in updates.items() if k in _USER_COLUMNS}
     set_clause = ", ".join(f"{k} = ?" for k in safe_updates)
     values = list(safe_updates.values()) + [user_id]
@@ -131,6 +131,63 @@ def delete_user(db, user_id):
     """Delete a user (cascade deletes all related data)."""
     db.execute("DELETE FROM users WHERE id = ?", (user_id,))
     db.commit()
+
+
+# ============================================================================
+# EMAIL VERIFICATION MODEL
+# ============================================================================
+
+def create_email_verification(db, user_id, code_hash, expires_at):
+    """Store a new OTP record and invalidate older codes for this user."""
+    verification_id = uuid.uuid4().hex
+    now = now_iso()
+    db.execute("UPDATE email_verifications SET verified_at = ? WHERE user_id = ? AND verified_at IS NULL",
+               (now, user_id))
+    db.execute(
+        """INSERT INTO email_verifications (id, user_id, code_hash, expires_at, attempts, created_at)
+           VALUES (?, ?, ?, ?, 0, ?)""",
+        (verification_id, user_id, code_hash, expires_at, now)
+    )
+    db.commit()
+    return get_email_verification_by_id(db, verification_id)
+
+
+def get_email_verification_by_id(db, verification_id):
+    row = db.execute("SELECT * FROM email_verifications WHERE id = ?", (verification_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_latest_email_verification(db, user_id):
+    """Return the newest OTP record for a user, including used codes."""
+    row = db.execute(
+        "SELECT * FROM email_verifications WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (user_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def increment_email_verification_attempt(db, verification_id):
+    db.execute(
+        "UPDATE email_verifications SET attempts = attempts + 1 WHERE id = ?",
+        (verification_id,)
+    )
+    db.commit()
+    return True
+
+
+def mark_email_verification_verified(db, verification_id):
+    db.execute(
+        "UPDATE email_verifications SET verified_at = ? WHERE id = ?",
+        (now_iso(), verification_id)
+    )
+    db.commit()
+    return True
+
+
+def delete_email_verifications_for_user(db, user_id):
+    db.execute("DELETE FROM email_verifications WHERE user_id = ?", (user_id,))
+    db.commit()
+    return True
 
 
 # ============================================================================

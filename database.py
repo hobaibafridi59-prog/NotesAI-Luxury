@@ -54,6 +54,12 @@ def init_db():
     """Initialize the database schema. Safe to call multiple times (idempotent)."""
     db = get_db()
     db.executescript(SCHEMA_SQL)
+
+    # Forward-only migration for databases created before email verification.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+    if "email_verified" not in columns:
+        db.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 1")
+
     db.commit()
     return db
 
@@ -92,6 +98,7 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT NOT NULL,
     role TEXT DEFAULT 'user' CHECK(role IN ('user', 'admin', 'legacy')),
     status TEXT DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'deleted')),
+    email_verified INTEGER DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_login_at TEXT
@@ -294,6 +301,22 @@ CREATE INDEX IF NOT EXISTS idx_exam_planners_user_id ON exam_planners(user_id);
 CREATE INDEX IF NOT EXISTS idx_exam_planners_user_exam ON exam_planners(user_id, exam_date);
 
 -- ============================================================================
+-- EMAIL VERIFICATION (OTP)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS email_verifications (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    code_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    attempts INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    verified_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_verifications_user_id ON email_verifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_email_verifications_user_created ON email_verifications(user_id, created_at);
+
+-- ============================================================================
 -- SCHEMA VERSION
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -303,6 +326,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES ('1.0.0', datetime('now'));
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES ('1.1.0', datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES ('1.2.0', datetime('now'));
 
 -- ============================================================================
 -- DEFAULT DATA
@@ -335,7 +359,7 @@ def get_table_names():
 _ALLOWED_TABLES = {
     "users", "refresh_tokens", "documents", "activity", "study_sets",
     "plans", "subscriptions", "payments", "usage", "provider_settings",
-    "password_reset_tokens", "schema_version",
+    "password_reset_tokens", "schema_version", "exam_planners", "email_verifications",
 }
 
 def _validate_table_name(table_name):

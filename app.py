@@ -24,7 +24,9 @@ import database
 import models
 import user_isolation
 import security
+import email_validation
 from auth import (register_user, login_user, refresh_access_token, logout_user,
+    issue_email_verification, verify_email_code,
     logout_all_devices, request_password_reset, reset_password, require_auth,
     require_admin as require_admin_auth, create_legacy_account, get_legacy_account_info,
     hash_password, verify_password, validate_password, validate_email,
@@ -5766,6 +5768,7 @@ html { scroll-behavior: smooth; }
 .auth-panel { transition: opacity .18s ease, transform .18s ease; }
 .auth-title { margin: 0 0 6px; font-size: 18px; }
 .auth-hint { margin: 0 0 16px; font-size: 11px; color: #64748b; line-height: 1.5; }
+.auth-helper { margin: 6px 0 0; font-size: 10.5px; color: #64748b; line-height: 1.45; }
 .auth-field { margin-bottom: 12px; }
 .auth-label { display: block; margin-bottom: 6px; font-size: 11px; font-weight: 600; color: #475569; }
 .auth-input-wrap { position: relative; }
@@ -15596,12 +15599,54 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     var button = form.querySelector('[type="submit"]');
     button.disabled = true;
     post('/api/auth/register', { name: name, email: email, password: passwordInput.value })
-      .then(finish)
+      .then(function (res) {
+        if (res.ok && res.data && res.data.verification_required) {
+          var verifyForm = modal.querySelector('[data-panel="verify"]');
+          verifyForm.querySelector('[name="email"]').value = email;
+          var target = modal.querySelector('[data-verify-email]');
+          if (target) target.textContent = email;
+          activate('verify');
+          setMsg(verifyForm.querySelector('[data-msg]'), res.data.message || 'Verification code sent to your email.', true);
+          return;
+        }
+        return finish(res);
+      })
       .catch(function (err) {
         var message = err.message || 'Registration failed.';
         if (/email/i.test(message)) { showFieldError(form, 'email', message); shake(emailInput); }
         else if (/password|character|uppercase|lowercase|digit/i.test(message)) { showFieldError(form, 'password', message); shake(passwordInput); }
         else { showFieldError(form, 'name', message); shake(nameInput); }
+      })
+      .finally(function () { button.disabled = false; });
+  }
+
+  function submitVerify(form) {
+    clearFieldErrors(form);
+    var email = form.querySelector('[name="email"]').value.trim();
+    var code = form.querySelector('[name="code"]').value.trim();
+    var button = form.querySelector('[type="submit"]');
+    var msg = form.querySelector('[data-msg]');
+    if (!/^\d{6}$/.test(code)) {
+      showFieldError(form, 'code', 'Enter the 6-digit code from your email.');
+      shake(form.querySelector('[name="code"]'));
+      return;
+    }
+    button.disabled = true;
+    setMsg(msg, 'Verifying…', true);
+    post('/api/auth/verify-email', { email: email, code: code })
+      .then(function (res) {
+        if (!res.ok || !res.data.verified) throw new Error(res.data.error || 'Verification failed.');
+        setMsg(msg, 'Email verified. Please sign in.', true);
+        var signinForm = modal.querySelector('[data-panel="signin"]');
+        setTimeout(function () {
+          activate('signin');
+          if (signinForm && email) signinForm.querySelector('[name="email"]').value = email;
+        }, 900);
+      })
+      .catch(function (err) {
+        showFieldError(form, 'code', err.message || 'Verification failed.');
+        shake(form.querySelector('[name="code"]'));
+        setMsg(msg, err.message || 'Verification failed.', false);
       })
       .finally(function () { button.disabled = false; });
   }
@@ -15739,6 +15784,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
             '<label class="auth-label" for="authSignupEmail">Email address</label>' +
             '<div class="auth-input-wrap"><span class="auth-input-icon">' + ICON_MAIL + '</span>' +
             '<input id="authSignupEmail" class="auth-input iconed" name="email" type="text" inputmode="email" autocomplete="username" placeholder="you@example.com" required></div>' +
+            '<p class="auth-helper">Please use a real email (Gmail, Yahoo, Outlook). Temporary emails are not allowed.</p>' +
             '<p class="auth-inline-error" data-email-error hidden></p>' +
           '</div>' +
 
@@ -15766,6 +15812,22 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
           '<button type="submit" class="auth-btn wide">Create Account</button>' +
           '<div class="auth-actions"><button type="button" class="auth-btn secondary" data-close>Cancel</button></div>' +
         '</form>' +
+
+        '<form class="auth-panel" data-panel="verify" novalidate>' +
+          '<h3 class="auth-title">Verify your email</h3>' +
+          '<p class="auth-hint">Enter the 6-digit code sent to <strong data-verify-email></strong>.</p>' +
+          '<input type="hidden" name="email" />' +
+          '<div class="auth-field">' +
+            '<label class="auth-label" for="authVerifyCode">Verification code</label>' +
+            '<div class="auth-input-wrap"><span class="auth-input-icon">' + ICON_LOCK + '</span>' +
+            '<input id="authVerifyCode" class="auth-input iconed" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" required></div>' +
+            '<p class="auth-inline-error" data-code-error hidden></p>' +
+          '</div>' +
+          '<p class="auth-msg" data-msg></p>' +
+          '<button type="submit" class="auth-btn wide">Verify Email</button>' +
+          '<div class="auth-actions"><button type="button" class="auth-btn secondary" data-resend-code>Resend code</button>' +
+          '<button type="button" class="auth-btn secondary" data-close>Cancel</button></div>' +
+        '</form>' +
       '</div>';
 
     document.body.appendChild(modal);
@@ -15778,7 +15840,9 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     modal.querySelectorAll('[data-panel]').forEach(function (form) {
       form.addEventListener('submit', function (e) {
         e.preventDefault();
-        if (form.getAttribute('data-panel') === 'signup') submitSignUp(form);
+        var panelName = form.getAttribute('data-panel');
+        if (panelName === 'signup') submitSignUp(form);
+        else if (panelName === 'verify') submitVerify(form);
         else submitSignIn(form);
       });
     });
@@ -15794,6 +15858,26 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     signup.querySelector('[name="confirm_password"]').addEventListener('input', function () { updateConfirmMatch(signup); });
 
     modal.querySelector('[data-forgot]').addEventListener('click', forgotPassword);
+
+    var resendBtn = modal.querySelector('[data-resend-code]');
+    if (resendBtn) {
+      resendBtn.addEventListener('click', function () {
+        var verifyForm = modal.querySelector('[data-panel="verify"]');
+        var email = verifyForm.querySelector('[name="email"]').value.trim();
+        var msg = verifyForm.querySelector('[data-msg]');
+        if (!email) { setMsg(msg, 'Email address is missing. Please start again.', false); return; }
+        resendBtn.disabled = true;
+        setMsg(msg, 'Sending a new code…', true);
+        post('/api/auth/resend-verification', { email: email })
+          .then(function (res) {
+            if (!res.ok) throw new Error(res.data.error || 'Could not resend the code.');
+            setMsg(msg, (res.data && res.data.message) || 'A new code has been sent.', true);
+          })
+          .catch(function (err) { setMsg(msg, err.message || 'Could not resend the code.', false); })
+          .finally(function () { resendBtn.disabled = false; });
+      });
+    }
+
     activate('signin');
   }
 
@@ -17860,21 +17944,51 @@ def generate_pdf():
 @app.route("/api/auth/register", methods=["POST"])
 @security.rate_limit("auth_register")
 def api_auth_register():
-    """Register a new user."""
+    """Register a new user with real-email validation."""
     payload = request.get_json(silent=True) or request.form
-    email = str(payload.get("email") or "").strip()
+    email = str(payload.get("email") or "").strip().lower()
     password = str(payload.get("password") or "")
     name = str(payload.get("name") or "").strip()
 
     if not email or not password or not name:
         return _error_response("Email, password, and name are required.", 400, "MISSING_FIELDS", retryable=False)
 
+    valid_email, email_error = email_validation.validate_real_email(email)
+    if not valid_email:
+        code = "DISPOSABLE_EMAIL" if email_validation.is_disposable_email(email) else "INVALID_EMAIL_DOMAIN"
+        security.audit_log("register_failed", {"email": email}, status="failure")
+        return _error_response(email_error, 400, code, retryable=False)
+
     database.init_db()
     db = database.get_db()
-    user, error = register_user(db, email, password, name)
+
+    # Once SMTP is configured, new accounts require an email OTP. Before that,
+    # registration keeps working exactly as before so the deployed app is safe.
+    require_verification = email_validation.smtp_configured()
+    user, error = register_user(db, email, password, name,
+                                email_verified=not require_verification)
     if error:
         security.audit_log("register_failed", {"email": email}, status="failure")
         return _error_response(error, 400, "REGISTRATION_FAILED", retryable=False)
+
+    if require_verification:
+        code = issue_email_verification(db, user)
+        sent, send_error = email_validation.send_verification_email(user["email"], code)
+        if not sent:
+            models.delete_email_verifications_for_user(db, user["id"])
+            models.delete_user(db, user["id"])
+            security.audit_log("verification_email_failed", {"email": email}, status="failure")
+            return _error_response(
+                send_error or "Could not send the verification email. Please retry.",
+                502, "EMAIL_SEND_FAILED", retryable=True,
+            )
+        security.audit_log("register_pending_verification", {"email": email, "user_id": user["id"]})
+        return jsonify({
+            "ok": True,
+            "verification_required": True,
+            "email": user["email"],
+            "message": "Verification code sent to your email.",
+        })
 
     security.audit_log("register_success", {"email": email, "user_id": user["id"]})
     # Auto-login after registration
@@ -17895,6 +18009,68 @@ def api_auth_register():
         "token_type": "Bearer",
         "expires_in": 900,  # 15 minutes
     })
+
+
+@app.route("/api/auth/verify-email", methods=["POST"])
+@security.rate_limit("api_general")
+def api_auth_verify_email():
+    """Activate an account with the 6-digit email OTP."""
+    payload = request.get_json(silent=True) or request.form
+    email = str(payload.get("email") or "").strip().lower()
+    code = str(payload.get("code") or "").strip()
+
+    if not email or not code:
+        return _error_response("Email and verification code are required.", 400,
+                               "MISSING_FIELDS", retryable=False)
+
+    database.init_db()
+    db = database.get_db()
+    user = models.get_user_by_email(db, email)
+    if not user:
+        return _error_response("Incorrect verification code.", 400, "INVALID_CODE", retryable=False)
+    if user.get("email_verified", 1):
+        return _error_response("This email is already verified.", 400, "ALREADY_VERIFIED", retryable=False)
+
+    ok, error = verify_email_code(db, user, code)
+    if not ok:
+        return _error_response(error, 400, "INVALID_CODE", retryable=False)
+
+    security.audit_log("email_verified", {"email": email, "user_id": user["id"]})
+    return jsonify({
+        "ok": True,
+        "verified": True,
+        "message": "Email verified. Please sign in.",
+    })
+
+
+@app.route("/api/auth/resend-verification", methods=["POST"])
+@security.rate_limit("api_general")
+def api_auth_resend_verification():
+    """Send a fresh OTP to an unverified account."""
+    payload = request.get_json(silent=True) or request.form
+    email = str(payload.get("email") or "").strip().lower()
+
+    if not email:
+        return _error_response("Email is required.", 400, "MISSING_FIELDS", retryable=False)
+    if not email_validation.smtp_configured():
+        return _error_response("Email verification is not configured yet.", 503,
+                               "EMAIL_VERIFY_UNAVAILABLE", retryable=False)
+
+    database.init_db()
+    db = database.get_db()
+    user = models.get_user_by_email(db, email)
+    generic = "If this account needs verification, a new code has been sent."
+    if not user or user.get("email_verified", 1):
+        return jsonify({"ok": True, "message": generic})
+
+    code = issue_email_verification(db, user)
+    sent, send_error = email_validation.send_verification_email(user["email"], code)
+    if not sent:
+        return _error_response(send_error or "Could not send the verification email.", 502,
+                               "EMAIL_SEND_FAILED", retryable=True)
+
+    security.audit_log("verification_resent", {"email": email, "user_id": user["id"]})
+    return jsonify({"ok": True, "message": generic})
 
 
 @app.route("/api/auth/login", methods=["POST"])

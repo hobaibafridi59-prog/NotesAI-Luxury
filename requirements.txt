@@ -36,3 +36,7 @@ python-bidi==0.4.2
 
 # Production WSGI server (required for PythonAnywhere/Render/Railway)
 gunicorn==23.0.0
+
+# Optional MX validation for real-email signup. The app skips MX checks
+# gracefully if this package is unavailable.
+dnspython==2.7.1
