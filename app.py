@@ -8344,7 +8344,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       <div class="activity-timeline" id="dashboardActivity">
         <div class="empty-state compact">
           <div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 64 64"><use href="#icon-empty-activity"></use></svg></div>
-          <h4>No recent activity</h4>
+          <h4>No recent activity yet.</h4>
           <p>Your document actions will appear here.</p>
           <a class="btn-3d btn-primary" href="/new-order">Create your first document</a>
         </div>
@@ -9334,7 +9334,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       <div class="activity-list" id="activityList">
         <div class="empty-state enhanced">
           <div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 64 64"><use href="#icon-empty-activity"></use></svg></div>
-          <h4>No recent activity</h4>
+          <h4>No recent activity yet.</h4>
           <p>Every upload, extraction and download will show up here as it happens.</p>
           <a class="btn-3d btn-primary" href="/new-order">Create your first document</a>
         </div>
@@ -10877,8 +10877,9 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     if (activityList) renderCompactLoading(activityList, 'Loading activity');
     if (dashboardActivity) renderCompactLoading(dashboardActivity, 'Loading activity');
     try {
-      const res = await fetch('/api/activity');
-      if (notesaiIsGuestUnauthorized(res)) {
+      const res = await fetchWithTimeout('/api/activity', { cache: 'no-store' }, 15000);
+      if (res.status === 401) {
+        try { sessionStorage.removeItem('notesaiAccessToken'); } catch (_) {}
         if (activityList) {
           activityList.innerHTML = notesaiGuestEmptyState(
             'activity', 'Sign in to see your activity',
@@ -11137,14 +11138,14 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     if (!list.length) {
       if (activityList) {
         activityList.innerHTML = emptyStateMarkup(
-          'activity', 'No recent activity',
+          'activity', 'No recent activity yet.',
           'Every upload, extraction and download will show up here as it happens.',
           'Create your first document', '/new-order'
         );
       }
       if (dashboardActivity) {
         dashboardActivity.innerHTML = emptyStateMarkup(
-          'activity', 'No recent activity', 'Your document actions will appear here.',
+          'activity', 'No recent activity yet.', 'Your document actions will appear here.',
           'Create your first document', '/new-order', true
         );
       }
