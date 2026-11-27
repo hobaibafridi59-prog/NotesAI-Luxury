@@ -20,6 +20,7 @@ import base64
 import json
 import uuid
 import secrets
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import request, jsonify, g
@@ -101,6 +102,102 @@ ACCESS_TOKEN_EXPIRY_MINUTES = 15
 REFRESH_TOKEN_EXPIRY_DAYS = 7
 PASSWORD_RESET_EXPIRY_HOURS = 1
 BCRYPT_COST = 12
+
+
+# ============================================================================
+# ADMIN SESSION (short-lived, scoped, HttpOnly cookie + CSRF)
+# ============================================================================
+ADMIN_SESSION_COOKIE = "notesai_admin_session"
+ADMIN_CSRF_COOKIE = "notesai_admin_csrf"
+ADMIN_SESSION_MAX_AGE = 30 * 60
+_admin_session_signer = URLSafeTimedSerializer(
+    f"{JWT_SECRET}|notesai-admin-session-v1", salt="notesai-admin-session"
+)
+
+
+def _admin_env_flag(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _local_user_dev_allowed():
+    """Loopback anonymous user access, only when explicitly enabled for dev."""
+    if not _admin_env_flag("NOTESAI_ALLOW_LOCALHOST_USER"):
+        return False
+    from app import _is_local_request
+    return _is_local_request()
+
+
+def _admin_cookie_secure():
+    return bool(request.is_secure or _admin_env_flag("NOTESAI_COOKIE_SECURE"))
+
+
+def create_admin_session(user_id):
+    """Return (signed_cookie_value, csrf_token) for an admin user."""
+    csrf = secrets.token_urlsafe(24)
+    token = _admin_session_signer.dumps({"uid": str(user_id), "csrf": csrf})
+    return token, csrf
+
+
+def decode_admin_session(token=""):
+    if not token:
+        return None
+    try:
+        data = _admin_session_signer.loads(token, max_age=ADMIN_SESSION_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return None
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    uid = str(data.get("uid") or "")
+    csrf = str(data.get("csrf") or "")
+    return {"uid": uid, "csrf": csrf} if uid and csrf else None
+
+
+def resolve_admin_session():
+    """Resolve and validate the current admin session cookie."""
+    data = decode_admin_session(request.cookies.get(ADMIN_SESSION_COOKIE, ""))
+    if not data:
+        return None
+    try:
+        db = database.get_db()
+        user = models.get_user_by_id(db, data["uid"])
+    except Exception:
+        return None
+    if not user or user.get("role") != "admin" or user.get("status") != "active":
+        return None
+    return {"user_id": data["uid"], "user": user, "csrf": data["csrf"]}
+
+
+def csrf_token_valid(session_data):
+    """Check CSRF for state-changing requests under cookie auth."""
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return True
+    supplied = request.headers.get("X-CSRF-Token", "") or request.form.get("csrf_token", "")
+    if not supplied:
+        payload = request.get_json(silent=True) or {}
+        supplied = str(payload.get("csrf_token") or "")
+    return bool(supplied) and hmac.compare_digest(str(supplied), session_data["csrf"])
+
+
+def set_admin_session_cookies(response, user_id):
+    token, csrf = create_admin_session(user_id)
+    secure = _admin_cookie_secure()
+    response.set_cookie(ADMIN_SESSION_COOKIE, token, max_age=ADMIN_SESSION_MAX_AGE,
+                        httponly=True, secure=secure, samesite="Strict", path="/")
+    response.set_cookie(ADMIN_CSRF_COOKIE, csrf, max_age=ADMIN_SESSION_MAX_AGE,
+                        httponly=False, secure=secure, samesite="Strict", path="/")
+    return response
+
+
+def clear_admin_session_cookies(response):
+    secure = _admin_cookie_secure()
+    response.delete_cookie(ADMIN_SESSION_COOKIE, path="/", samesite="Strict", secure=secure)
+    response.delete_cookie(ADMIN_CSRF_COOKIE, path="/", samesite="Strict", secure=secure)
+    return response
 
 
 # ============================================================================
@@ -263,6 +360,12 @@ def require_auth(f):
         if user.get("status") != "active":
             return jsonify({"error": "Account is not active", "code": "ACCOUNT_INACTIVE"}), 403
 
+        if _local_user_dev_allowed():
+            g.user_id = None
+            g.user = None
+            g.user_role = "user"
+            return f(*args, **kwargs)
+
         g.user_id = payload["user_id"]
         g.user = user
         g.user_role = user.get("role", "user")
@@ -271,19 +374,42 @@ def require_auth(f):
 
 
 def require_admin(f):
-    """Decorator: requires admin role or admin token."""
+    """Require a short-lived admin session or an admin JWT.
+
+    Static admin tokens and anonymous loopback access are disabled by default.
+    They can be re-enabled explicitly for migration via
+    NOTESAI_ALLOW_ADMIN_TOKEN_HEADER / NOTESAI_ALLOW_LOCALHOST_ADMIN.
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Check admin token first (existing mechanism)
-        from app import _admin_token_from_request, _is_local_request
-        supplied = _admin_token_from_request()
-        configured = os.environ.get("NOTESAI_ADMIN_TOKEN", "").strip()
-        if configured and supplied and hmac.compare_digest(supplied, configured):
-            return f(*args, **kwargs)
-        if _is_local_request() and not configured:
+        session = resolve_admin_session()
+        if session:
+            if not csrf_token_valid(session):
+                return jsonify({"error": "CSRF token missing or invalid", "code": "CSRF_INVALID"}), 403
+            g.user_id = session["user_id"]
+            g.user = session["user"]
+            g.user_role = "admin"
+            g.admin_session = session
             return f(*args, **kwargs)
 
-        # Check JWT admin role
+        if _admin_env_flag("NOTESAI_ALLOW_ADMIN_TOKEN_HEADER"):
+            from app import _admin_token_from_request
+            supplied = _admin_token_from_request()
+            configured = os.environ.get("NOTESAI_ADMIN_TOKEN", "").strip()
+            if configured and supplied and hmac.compare_digest(supplied, configured):
+                g.user_id = None
+                g.user = None
+                g.user_role = "admin"
+                return f(*args, **kwargs)
+
+        if _admin_env_flag("NOTESAI_ALLOW_LOCALHOST_ADMIN"):
+            from app import _is_local_request
+            if _is_local_request():
+                g.user_id = None
+                g.user = None
+                g.user_role = "admin"
+                return f(*args, **kwargs)
+
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
@@ -304,34 +430,41 @@ def require_admin(f):
 
 
 def require_user_or_admin(f):
-    """Decorator: requires user auth (JWT) OR admin token OR localhost access.
+    """Require an admin session/JWT or a normal user JWT.
 
-    This allows:
-    - Admin token (existing mechanism)
-    - Localhost without token (existing web app behavior)
-    - JWT access token (new, for Android app users)
-
-    If none of these, returns 401.
-    Sets g.user_id and g.user when JWT is present.
+    Cookie-based admin access is CSRF-protected. Legacy static token and
+    loopback bypass require explicit opt-in env flags.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
-        # 1. Check admin token (existing mechanism)
-        from app import _admin_token_from_request, _is_local_request
-        supplied = _admin_token_from_request()
-        configured = os.environ.get("NOTESAI_ADMIN_TOKEN", "").strip()
-        if configured and supplied and hmac.compare_digest(supplied, configured):
-            g.user_id = None
-            g.user = None
+        session = resolve_admin_session()
+        if session:
+            if not csrf_token_valid(session):
+                return jsonify({"error": "CSRF token missing or invalid", "code": "CSRF_INVALID"}), 403
+            g.user_id = session["user_id"]
+            g.user = session["user"]
             g.user_role = "admin"
-            return f(*args, **kwargs)
-        if _is_local_request() and not configured:
-            g.user_id = None
-            g.user = None
-            g.user_role = "admin"
+            g.admin_session = session
             return f(*args, **kwargs)
 
-        # 2. Check JWT token
+        if _admin_env_flag("NOTESAI_ALLOW_ADMIN_TOKEN_HEADER"):
+            from app import _admin_token_from_request
+            supplied = _admin_token_from_request()
+            configured = os.environ.get("NOTESAI_ADMIN_TOKEN", "").strip()
+            if configured and supplied and hmac.compare_digest(supplied, configured):
+                g.user_id = None
+                g.user = None
+                g.user_role = "admin"
+                return f(*args, **kwargs)
+
+        if _admin_env_flag("NOTESAI_ALLOW_LOCALHOST_ADMIN"):
+            from app import _is_local_request
+            if _is_local_request():
+                g.user_id = None
+                g.user = None
+                g.user_role = "admin"
+                return f(*args, **kwargs)
+
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
@@ -347,7 +480,12 @@ def require_user_or_admin(f):
             except ValueError:
                 pass
 
-        # 3. No valid auth found
+        if _local_user_dev_allowed():
+            g.user_id = None
+            g.user = None
+            g.user_role = "user"
+            return f(*args, **kwargs)
+
         return jsonify({"error": "Authentication required", "code": "AUTH_REQUIRED"}), 401
     return decorated
 

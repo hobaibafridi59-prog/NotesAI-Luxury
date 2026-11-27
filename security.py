@@ -43,12 +43,18 @@ RATE_LIMITS = {
     "api_admin": {"max_requests": 30, "window_seconds": 60},         # 30 per minute
 }
 
-# CORS allowed origins
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
+# CORS allowed origins. Extra origins can be added with NOTESAI_CORS_ORIGINS
+# (comma-separated) without editing source.
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+    "https://hobaibafridi59.pythonanywhere.com",
     "https://notesai.app",
     "https://www.notesai.app",
+]
+_extra_origins = [o.strip() for o in os.getenv("NOTESAI_CORS_ORIGINS", "").split(",") if o.strip()]
+CORS_ALLOWED_ORIGINS = _DEFAULT_CORS_ORIGINS + [
+    o for o in _extra_origins if o not in _DEFAULT_CORS_ORIGINS
 ]
 
 # File upload limits
@@ -199,7 +205,7 @@ def add_cors_headers(response):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Token, X-NotesAI-Premium"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-CSRF-Token, X-NotesAI-Premium"
         response.headers["Access-Control-Max-Age"] = "3600"
     return response
 
@@ -375,7 +381,9 @@ def init_security(app):
 # ============================================================================
 
 def get_client_ip():
-    """Get the real client IP (handling proxies)."""
-    # Only trust X-Forwarded-For if behind a known proxy
-    # For now, use remote_addr directly
+    """Get the request client IP.
+
+    X-Forwarded-For is applied by Werkzeug ProxyFix only when
+    NOTESAI_TRUST_PROXY_COUNT is explicitly configured.
+    """
     return request.remote_addr or "unknown"

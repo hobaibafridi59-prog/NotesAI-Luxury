@@ -31,14 +31,14 @@ class DiagramRenderError(RuntimeError):
 _RENDERERS: dict[str, Callable[[dict], str]] = {}
 _ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
 _DIAGRAM_STYLES = {
-    "color", "pencil", "3d", "simple",
+    "color", "pencil", "3d", "simple", "universal",
     "medical", "vector", "schematic", "molecule2d", "structure3d",
     "outline", "topographic",
 }
 
 
 def normalise_diagram_style(value: Any) -> str:
-    style = str(value or "color").strip().lower()
+    style = str(value or "universal").strip().lower()
     return style if style in _DIAGRAM_STYLES else "color"
 
 # Conservative educational palette.

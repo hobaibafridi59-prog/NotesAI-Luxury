@@ -12,6 +12,7 @@ import urllib.parse
 import uuid
 import subprocess
 import hashlib
+import math
 import shutil
 import zipfile
 from functools import wraps
@@ -27,11 +28,14 @@ from auth import (register_user, login_user, refresh_access_token, logout_user,
     logout_all_devices, request_password_reset, reset_password, require_auth,
     require_admin as require_admin_auth, create_legacy_account, get_legacy_account_info,
     hash_password, verify_password, validate_password, validate_email,
-    get_current_user, get_current_user_id, is_admin, require_user_or_admin)
+    get_current_user, get_current_user_id, is_admin, require_user_or_admin,
+    verify_access_token, resolve_admin_session, csrf_token_valid,
+    set_admin_session_cookies, clear_admin_session_cookies)
 from fpdf.enums import XPos, YPos
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from markupsafe import escape
 import requests
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from notesai_schema import (
     analysis_has_arabic,
@@ -62,6 +66,14 @@ watermark_engine.sync_constants(WATERMARK_TEXT, WATERMARK_ENABLED)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+
+# Only trust X-Forwarded-* headers when the number of proxy hops is set explicitly.
+try:
+    _trust_proxy_count = max(0, int(os.getenv("NOTESAI_TRUST_PROXY_COUNT", "0") or 0))
+except (TypeError, ValueError):
+    _trust_proxy_count = 0
+if _trust_proxy_count:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_trust_proxy_count, x_proto=_trust_proxy_count)
 
 # Initialize security middleware
 security.init_security(app)
@@ -261,6 +273,11 @@ MAX_STORED_DOCUMENTS = 100
 STUDY_SETS_FILE = PROJECT_ROOT / "study_sets.json"
 BILLING_FILE = PROJECT_ROOT / "billing.json"
 MAX_STUDY_SETS = 100
+MAX_PLANNER_DAYS = 365
+MAX_PLANNER_PASTED_CHARS = 50000
+MAX_PLANNER_SOURCE_CHARS = 60000
+MAX_PLANNER_DOCUMENTS = 12
+MAX_PLANNER_AI_MAX_TOKENS = 8192
 PLAN_LIMITS = {
     "free": {"label": "Free workspace", "max_documents": 100, "max_storage_mb": 250},
     "pro": {"label": "Professional workspace", "max_documents": 500, "max_storage_mb": 2048},
@@ -282,6 +299,7 @@ STUDY_ACTIONS = {
     "chapter_summary": ("Chapter summary", "Write a chapter-style summary with key definitions and examples."),
     "explain": ("Explain simply", "Explain the difficult ideas in simple language with small examples."),
     "revision": ("Revision sheet", "Create a compact revision sheet with facts, definitions, formulas, and quick checks."),
+    "exam_pack": ("Exam Pack", "Create one complete exam-ready pack in Markdown with these exact sections: '## Quick Summary', '## Key Points', '## One-Page Revision Sheet', '## Flashcards' with Q/A pairs, and '## Practice Questions' with short answers. Keep everything strictly grounded in the notes and compact enough to print."),
 }
 _STUDY_LOCK = threading.RLock()
 _BILLING_LOCK = threading.RLock()
@@ -574,6 +592,543 @@ def _visible_study_sets(items, user_id):
             if not _study_set_owner(item) or _study_set_owner(item) == user_id]
 
 
+# ---------------------------------------------------------------------------
+# AI Exam Planner — backend helpers
+# ---------------------------------------------------------------------------
+def _planner_db():
+    """Idempotent access to the existing SQLite database."""
+    return database.init_db()
+
+
+def _planner_user_id():
+    """Strict owner id; legacy anonymous/admin bypass never owns a planner."""
+    return str(get_current_user_id() or "")
+
+
+def _planner_flag(value):
+    return value is True or str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _clean_planner_text(value, limit=300):
+    return _clean_pdf_text(value)[:limit]
+
+
+def _planner_string_list(value, max_items=8, max_chars=300):
+    if isinstance(value, str):
+        parts = [part for part in re.split(r"[\n;]+", value) if part.strip()]
+    elif isinstance(value, list):
+        parts = value
+    else:
+        parts = []
+    output = []
+    for part in parts:
+        text = _clean_planner_text(part, max_chars)
+        if text and text not in output:
+            output.append(text)
+        if len(output) >= max_items:
+            break
+    return output
+
+
+def _parse_planner_date(value):
+    try:
+        return date.fromisoformat(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_planner_today(payload):
+    """Use the browser's local date when supplied; sanity-check against server."""
+    raw = str(payload.get("today") or "").strip()
+    parsed = _parse_planner_date(raw) if raw else datetime.now().date()
+    if not parsed:
+        return None
+    if abs((parsed - datetime.now().date()).days) > 1:
+        return None
+    return parsed
+
+
+def _parse_planner_exam_date(value, today):
+    exam_date = _parse_planner_date(value)
+    if not exam_date:
+        return None
+    days = (exam_date - today).days
+    if days < 1 or days > MAX_PLANNER_DAYS:
+        return None
+    return exam_date, days
+
+
+def _parse_daily_hours(value):
+    try:
+        hours = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(hours):
+        return None
+    hours = round(hours, 2)
+    if hours < 0.5 or hours > 16:
+        return None
+    return hours
+
+
+def _parse_duration(value, default=None):
+    if value in (None, ""):
+        return default
+    try:
+        parsed = int(round(float(str(value).strip())))
+    except (TypeError, ValueError):
+        return default if default is not None else None
+    return parsed if parsed > 0 else (default if default is not None else None)
+
+
+def _planner_dates(today, days):
+    """Day 1 is today; the exam date itself is never a normal study day."""
+    return [today + timedelta(days=offset) for offset in range(int(days))]
+
+
+def _planner_blank_progress():
+    return {"completed": {}, "missed_days": []}
+
+
+def _planner_progress_summary(schedule, progress):
+    days = (schedule or {}).get("days") or []
+    progress = progress or {}
+    completed = progress.get("completed") if isinstance(progress.get("completed"), dict) else {}
+    missed = progress.get("missed_days") if isinstance(progress.get("missed_days"), list) else []
+    missed_numbers = {int(value) for value in missed if str(value).isdigit()}
+
+    total_topics = 0
+    completed_topics = 0
+    completed_days = 0
+    missed_days = 0
+    day_details = []
+    for day in days:
+        topics = day.get("topics") or []
+        ids = [str(topic.get("id") or "") for topic in topics if isinstance(topic, dict)]
+        done = sum(1 for topic_id in ids if completed.get(topic_id))
+        total_topics += len(ids)
+        completed_topics += done
+        is_complete = bool(ids) and done == len(ids)
+        is_missed = int(day.get("day_number") or 0) in missed_numbers
+        completed_days += 1 if is_complete else 0
+        missed_days += 1 if is_missed else 0
+        day_details.append({
+            "day_number": day.get("day_number"),
+            "date": day.get("date"),
+            "completed_topics": done,
+            "total_topics": len(ids),
+            "percent": int(round(done / len(ids) * 100)) if ids else 0,
+            "completed": is_complete,
+            "missed": is_missed,
+        })
+
+    pending_days = max(0, len(days) - completed_days)
+    remaining_topics = max(0, total_topics - completed_topics)
+    overall = int(round(completed_topics / total_topics * 100)) if total_topics else 0
+    return {
+        "total_days": len(days),
+        "completed_days": completed_days,
+        "pending_days": pending_days,
+        "missed_days": missed_days,
+        "total_topics": total_topics,
+        "completed_topics": completed_topics,
+        "remaining_topics": remaining_topics,
+        "overall_percent": overall,
+        "days": day_details,
+    }
+
+
+def _public_planner(item, include_schedule=True):
+    record = item or {}
+    summary = _planner_progress_summary(record.get("schedule"), record.get("progress"))
+    result = {
+        "id": record.get("id"),
+        "title": record.get("title"),
+        "exam_name": record.get("exam_name"),
+        "exam_date": record.get("exam_date"),
+        "today": record.get("today"),
+        "daily_hours": record.get("daily_hours"),
+        "days_remaining": record.get("days_remaining"),
+        "total_hours": record.get("total_hours"),
+        "source_summary": record.get("source_summary"),
+        "warnings": record.get("warnings") or [],
+        "status": record.get("status"),
+        "version": record.get("version"),
+        "provider": record.get("provider"),
+        "model": record.get("model"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "progress_summary": summary,
+    }
+    if include_schedule:
+        result["schedule"] = record.get("schedule") or {}
+        result["progress"] = record.get("progress") or _planner_blank_progress()
+    return result
+
+
+def _resolve_planner_sources(payload, user_id):
+    """Combine bounded pasted notes and owned documents into planner source text."""
+    pasted = str(payload.get("text") or "").strip()[:MAX_PLANNER_PASTED_CHARS]
+    ids = payload.get("document_ids") or []
+    if isinstance(ids, str):
+        ids = [part.strip() for part in re.split(r"[,،]+", ids) if part.strip()]
+    elif not isinstance(ids, list):
+        ids = []
+    single = str(payload.get("document_id") or "").strip()
+    if single and single not in ids:
+        ids.insert(0, single)
+    if len(ids) > MAX_PLANNER_DOCUMENTS:
+        return None, _error_response(
+            f"Select at most {MAX_PLANNER_DOCUMENTS} documents.", 400,
+            "PLANNER_TOO_MANY_DOCUMENTS", retryable=False,
+        )
+
+    sections = []
+    names = []
+    ordered_ids = []
+    for document_id in ids:
+        document_id = str(document_id or "").strip()
+        if not document_id or document_id in ordered_ids:
+            continue
+        ordered_ids.append(document_id)
+        if not security.validate_document_id(document_id):
+            return None, _error_response("A selected document id is invalid.", 400,
+                                         "INVALID_DOCUMENT_ID", retryable=False)
+        document = get_document(document_id)
+        if not document:
+            return None, _error_response("A selected document was not found.", 404,
+                                         "DOCUMENT_NOT_FOUND", retryable=False)
+        if not user_isolation.verify_document_ownership(document, user_id):
+            return None, _error_response("You do not have access to one of those documents.", 403,
+                                         "DOCUMENT_FORBIDDEN", retryable=False)
+        text = _document_text_for_study(document)
+        if text:
+            name = str(document.get("name") or "Saved document")[:200]
+            sections.append("### " + name + "\n" + text)
+            names.append(name)
+
+    combined = "\n\n".join([pasted] + sections).strip()
+    if not combined:
+        return None, _error_response(
+            "Add pasted notes or select at least one saved document.", 400,
+            "PLANNER_SOURCE_REQUIRED", retryable=False,
+        )
+    truncated = len(combined) > MAX_PLANNER_SOURCE_CHARS
+    if truncated:
+        combined = combined[:MAX_PLANNER_SOURCE_CHARS] + "\n[Source material shortened for planning.]"
+    source_summary = "Pasted notes (%d chars)" % len(pasted)
+    if names:
+        source_summary += " · " + ", ".join(names[:6])
+        if len(names) > 6:
+            source_summary += " +%d more" % (len(names) - 6)
+    return {
+        "text": combined,
+        "document_ids": ordered_ids,
+        "document_names": names,
+        "truncated": truncated,
+        "source_summary": _clean_planner_text(source_summary, 1000),
+    }, None
+
+
+def build_exam_planner_prompt(exam_name, exam_date, days_remaining, daily_hours,
+                              total_hours, source_material, dates=None):
+    """Build the strict JSON-only exam planner prompt for the active provider."""
+    date_list = ", ".join(
+        "%s (%s)" % (item.isoformat(), item.strftime("%A")) for item in (dates or [])
+    )
+    return (
+        "You are an expert academic tutor and intelligent exam preparation planner.\n\n"
+        "Your task is to create a realistic, structured, personalized day-by-day revision schedule.\n\n"
+        "Student information:\n"
+        "- Exam: {exam}\n"
+        "- Exam Date: {exam_date}\n"
+        "- Days Available: {days}\n"
+        "- Daily Study Hours: {hours}\n"
+        "- Total Available Study Hours: {total}\n"
+        "- Study Material: {material}\n\n"
+        "Authoritative study dates (use these exactly; never schedule on the exam date): {date_list}\n\n"
+        "Instructions:\n"
+        "1. Carefully analyze the provided study material.\n"
+        "2. Identify all important chapters, topics and subtopics.\n"
+        "3. Divide the material logically across the available days.\n"
+        "4. Allocate more time to difficult and important topics.\n"
+        "5. Respect the student's daily available study hours.\n"
+        "6. Include short breaks where appropriate.\n"
+        "7. Include active recall, self-testing and practice questions.\n"
+        "8. Include revision sessions throughout the schedule.\n"
+        "9. Include a final preparation day with revision and practice tests.\n"
+        "10. Do not invent chapters or claim that material was covered if it is not present in the source.\n"
+        "11. If the available time is insufficient, clearly warn the student and prioritize important topics.\n"
+        "12. Avoid repeating the same topics unnecessarily.\n"
+        "13. Make the schedule practical and achievable.\n"
+        "14. Use the actual weekday and date for every scheduled day.\n"
+        "15. Never schedule normal study sessions on the exam date.\n\n"
+        "Return valid structured JSON following this schema, with exactly {days} day entries:\n"
+        '{{\n  "summary": "short realistic overview",\n'
+        '  "warnings": ["only if time is insufficient or material is limited"],\n'
+        '  "days": [\n'
+        '    {{\n'
+        '      "day_number": 1,\n'
+        '      "date": "YYYY-MM-DD",\n'
+        '      "weekday": "Monday",\n'
+        '      "daily_duration_minutes": 120,\n'
+        '      "topics": [\n'
+        '        {{\n'
+        '          "id": "d1-t1",\n'
+        '          "title": "topic from the source material",\n'
+        '          "duration_minutes": 30,\n'
+        '          "tasks": ["specific activity"],\n'
+        '          "revision": ["active recall activity"],\n'
+        '          "practice_tests": ["practice question or test"],\n'
+        '          "motivation": "short guidance"\n'
+        '        }}\n'
+        '      ],\n'
+        '      "revision": ["quick revision activity"],\n'
+        '      "practice_tests": ["practice test activity"],\n'
+        '      "motivation": "short motivational guidance"\n'
+        '    }}\n'
+        '  ]\n'
+        '}}\n\n'
+        "All durations are integer minutes. Topic durations for one day must not exceed "
+        "{minute_limit} minutes. Return valid structured JSON following the required backend "
+        "schema. Do not wrap JSON inside Markdown code fences."
+    ).format(
+        exam=_clean_planner_text(exam_name, 200),
+        exam_date=str(exam_date),
+        days=int(days_remaining),
+        hours=float(daily_hours),
+        total=float(total_hours),
+        material=str(source_material or "")[:MAX_PLANNER_SOURCE_CHARS],
+        date_list=date_list,
+        minute_limit=int(round(float(daily_hours) * 60)),
+    )
+
+
+def _parse_planner_ai_json(raw_text):
+    text = str(raw_text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None, "The AI response did not contain a JSON object."
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except (TypeError, ValueError):
+        return None, "The AI response was not valid JSON."
+    if not isinstance(parsed, dict):
+        return None, "The AI response was not a JSON object."
+    return parsed, ""
+
+
+def _normalise_planner_schedule(raw, dates, daily_hours):
+    """Validate and rewrite AI output into authoritative, safe planner data."""
+    if not isinstance(raw.get("days"), list) or len(raw["days"]) != len(dates):
+        return None, "The AI returned an incomplete schedule. Please retry."
+
+    minute_limit = int(round(float(daily_hours) * 60))
+    seen_ids = set()
+    seen_days = set()
+    normalised_days = []
+
+    for index, (raw_day, planned_date) in enumerate(zip(raw["days"], dates), start=1):
+        if not isinstance(raw_day, dict):
+            return None, "The AI returned an invalid day entry."
+        try:
+            raw_number = int(raw_day.get("day_number", index))
+        except (TypeError, ValueError):
+            return None, "The AI returned an invalid day number."
+        if raw_number in seen_days:
+            return None, "The AI returned duplicate day numbers."
+        seen_days.add(raw_number)
+
+        raw_topics = raw_day.get("topics")
+        if not isinstance(raw_topics, list) or not raw_topics:
+            return None, "The AI returned a day without topics."
+        topics = []
+        total_minutes = 0
+        for topic_index, raw_topic in enumerate(raw_topics, start=1):
+            if not isinstance(raw_topic, dict):
+                return None, "The AI returned an invalid topic."
+            title = _clean_planner_text(raw_topic.get("title") or raw_topic.get("topic"), 240)
+            if not title:
+                return None, "The AI returned a topic without a title."
+            duration = _parse_duration(raw_topic.get("duration_minutes") or raw_topic.get("duration"))
+            if not duration:
+                return None, "The AI returned an invalid topic duration."
+            raw_id = _clean_planner_text(raw_topic.get("id"), 64)
+            topic_id = raw_id or "d%d-t%d" % (index, topic_index)
+            if topic_id in seen_ids:
+                topic_id = "d%d-t%d" % (index, topic_index)
+            seen_ids.add(topic_id)
+            topics.append({
+                "id": topic_id,
+                "title": title,
+                "duration_minutes": min(duration, minute_limit),
+                "tasks": _planner_string_list(raw_topic.get("tasks") or raw_topic.get("activities")),
+                "revision": _planner_string_list(raw_topic.get("revision") or raw_topic.get("revision_tasks")),
+                "practice_tests": _planner_string_list(
+                    raw_topic.get("practice_tests") or raw_topic.get("practice") or raw_topic.get("quizzes")
+                ),
+                "motivation": _clean_planner_text(raw_topic.get("motivation"), 300),
+                "completed": False,
+            })
+            total_minutes += min(duration, minute_limit)
+
+        if total_minutes > minute_limit:
+            return None, "The AI exceeded the daily study-hour limit."
+        declared = _parse_duration(raw_day.get("daily_duration_minutes"), total_minutes)
+        normalised_days.append({
+            "day_number": index,
+            "date": planned_date.isoformat(),
+            "weekday": planned_date.strftime("%A"),
+            "daily_duration_minutes": min(max(declared, total_minutes), minute_limit),
+            "topics": topics,
+            "revision": _planner_string_list(raw_day.get("revision")),
+            "practice_tests": _planner_string_list(raw_day.get("practice_tests") or raw_day.get("practice")),
+            "motivation": _clean_planner_text(raw_day.get("motivation"), 300),
+            "missed": False,
+            "is_final_revision": index == len(dates),
+        })
+
+    return {
+        "summary": _clean_planner_text(raw.get("summary"), 800),
+        "warnings": _planner_string_list(raw.get("warnings"), 20, 300),
+        "days": normalised_days,
+    }, ""
+
+
+def _build_reschedule_preview(schedule, progress, today, remaining_days, daily_hours):
+    """Redistribute unfinished topics without touching completed work."""
+    dates = _planner_dates(today, remaining_days)
+    minute_limit = int(round(float(daily_hours) * 60))
+    old_days = (schedule or {}).get("days") or []
+    progress = progress or {}
+    completed = progress.get("completed") if isinstance(progress.get("completed"), dict) else {}
+    missed = progress.get("missed_days") if isinstance(progress.get("missed_days"), list) else []
+    missed_numbers = {int(value) for value in missed if str(value).isdigit()}
+
+    new_days = []
+    for index, planned_date in enumerate(dates, start=1):
+        new_days.append({
+            "day_number": index,
+            "date": planned_date.isoformat(),
+            "weekday": planned_date.strftime("%A"),
+            "daily_duration_minutes": 0,
+            "topics": [],
+            "revision": [],
+            "practice_tests": [],
+            "motivation": "",
+            "missed": False,
+            "is_final_revision": index == len(dates),
+        })
+    by_date = {day["date"]: day for day in new_days}
+
+    old_last = old_days[-1] if old_days and isinstance(old_days[-1], dict) else {}
+    if dates and by_date:
+        final_day = by_date[dates[-1].isoformat()]
+        final_day["revision"] = _planner_string_list(old_last.get("revision"))
+        final_day["practice_tests"] = _planner_string_list(old_last.get("practice_tests"))
+        final_day["motivation"] = _clean_planner_text(old_last.get("motivation"), 300)
+
+    unplaced = []
+    warnings = []
+
+    def used_minutes(day):
+        return sum(int(topic.get("duration_minutes") or 0) for topic in day["topics"])
+
+    def place(topic, preferred_date, completed_topic=False):
+        duration = int(topic.get("duration_minutes") or 0)
+        if duration <= 0:
+            return True
+        candidates = []
+        if preferred_date in by_date and by_date[preferred_date] not in candidates:
+            candidates.append(by_date[preferred_date])
+        candidates.extend(day for day in new_days if day not in candidates)
+        for day in candidates:
+            if completed_topic or used_minutes(day) + duration <= minute_limit:
+                item = dict(topic)
+                item["completed"] = bool(completed_topic)
+                day["topics"].append(item)
+                return True
+        unplaced.append(topic)
+        return False
+
+    for old_day in old_days:
+        if not isinstance(old_day, dict):
+            continue
+        old_date = str(old_day.get("date") or "")
+        if int(old_day.get("day_number") or 0) in missed_numbers and old_date in by_date:
+            by_date[old_date]["missed"] = True
+        for topic in old_day.get("topics") or []:
+            if not isinstance(topic, dict):
+                continue
+            topic_id = str(topic.get("id") or "")
+            if completed.get(topic_id):
+                place(topic, old_date, completed_topic=True)
+            else:
+                place(topic, old_date)
+
+    kept_ids = {
+        str(topic.get("id") or "")
+        for day in new_days for topic in day["topics"] if isinstance(topic, dict)
+    }
+    new_progress = {
+        "completed": {key: True for key in completed if key in kept_ids},
+        "missed_days": [day["day_number"] for day in new_days if day["missed"]],
+    }
+    for day in new_days:
+        day["daily_duration_minutes"] = used_minutes(day)
+
+    if unplaced:
+        warnings.append(
+            "%d unfinished topic(s) could not fit into the remaining days "
+            "without exceeding your daily study limit." % len(unplaced)
+        )
+    if any(day["daily_duration_minutes"] > minute_limit for day in new_days):
+        warnings.append("A day still exceeds the selected daily study limit.")
+    can_apply = not unplaced and not any(
+        day["daily_duration_minutes"] > minute_limit for day in new_days
+    )
+    if not can_apply:
+        warnings.append("The remaining time is not enough; shorten topics or increase daily hours first.")
+
+    preview_schedule = {
+        "summary": _clean_planner_text((schedule or {}).get("summary"), 800),
+        "warnings": warnings,
+        "days": new_days,
+    }
+    return {
+        "schedule": preview_schedule,
+        "progress": new_progress,
+        "warnings": warnings,
+        "can_apply": can_apply,
+        "unplaced_topics": [_clean_planner_text(item.get("title"), 200) for item in unplaced],
+    }
+
+
+def _owned_planner_or_response(planner_id):
+    """Return (planner, None) or (None, error response) with strict ownership."""
+    planner_id = str(planner_id or "").strip()
+    if not re.fullmatch(r"[a-f0-9]{32}", planner_id):
+        return None, _error_response("Invalid planner id.", 400, "INVALID_PLANNER_ID", retryable=False)
+    user_id = _planner_user_id()
+    if not user_id:
+        return None, _error_response("A signed-in account is required.", 403,
+                                     "PLANNER_OWNER_REQUIRED", retryable=False)
+    item = models.get_planner(_planner_db(), planner_id, user_id)
+    if not item:
+        return None, _error_response("Planner not found.", 404, "PLANNER_NOT_FOUND", retryable=False)
+    return item, None
+
+
+def _planner_response(payload, status=200):
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
 def save_study_set(action, result, source_document=None, language="English",
                    provider="", model="", title="", owner="", tags=None, pinned=False):
     study_id = uuid.uuid4().hex
@@ -731,7 +1286,7 @@ def save_generated_document(pdf_bytes, name, kind, options=None, text="", provid
         "provider": provider or "",
         "model": model or "",
         "style": options.get("style", "professional"),
-        "diagram_style": normalise_diagram_style(options.get("diagramStyle", "color")),
+        "diagram_style": normalise_diagram_style(options.get("diagramStyle", "universal")),
         "page_size": options.get("pageSize", "A4"),
         "orientation": options.get("orientation", "P"),
         "margin": options.get("margin", 12),
@@ -1159,26 +1714,62 @@ def _admin_error(message, code):
     }), 403
 
 
+def _admin_flag_enabled(name):
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def require_admin():
     """Block unauthorized callers from changing server configuration.
 
-    Local (loopback) requests are always allowed. Remote requests must present
-    NOTESAI_ADMIN_TOKEN via the X-Admin-Token header or an ``admin_token``
-    JSON field. When no token is configured, remote access stays blocked
-    (fail-closed) instead of silently allowing anonymous changes.
+    Accepts a short-lived admin session cookie (CSRF-protected) or an admin JWT.
+    Static admin tokens and anonymous loopback access are disabled unless
+    explicitly re-enabled for migration via env flags.
     """
-    expected = os.getenv(ADMIN_TOKEN_ENV, "").strip()
-    supplied = _admin_token_from_request()
-    if expected and supplied and hmac.compare_digest(supplied, expected):
+    session = resolve_admin_session()
+    if session:
+        if not csrf_token_valid(session):
+            return _admin_error("CSRF token missing or invalid", "CSRF_INVALID")
+        g.user_id = session["user_id"]
+        g.user = session["user"]
+        g.user_role = "admin"
+        g.admin_session = session
         return None
-    if _is_local_request():
+
+    if _admin_flag_enabled("NOTESAI_ALLOW_ADMIN_TOKEN_HEADER"):
+        expected = os.getenv(ADMIN_TOKEN_ENV, "").strip()
+        supplied = _admin_token_from_request()
+        if expected and supplied and hmac.compare_digest(supplied, expected):
+            g.user_id = None
+            g.user = None
+            g.user_role = "admin"
+            return None
+
+    if _admin_flag_enabled("NOTESAI_ALLOW_LOCALHOST_ADMIN") and _is_local_request():
+        g.user_id = None
+        g.user = None
+        g.user_role = "admin"
         return None
-    if not expected:
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            payload = verify_access_token(auth_header[7:].strip())
+            db = database.get_db()
+            user = models.get_user_by_id(db, payload["user_id"])
+            if user and user.get("role") == "admin" and user.get("status") == "active":
+                g.user_id = payload["user_id"]
+                g.user = user
+                g.user_role = "admin"
+                return None
+        except Exception:
+            pass
+
+    if not os.getenv(ADMIN_TOKEN_ENV, "").strip():
         return _admin_error(
-            "Admin token is not configured on the server. Set NOTESAI_ADMIN_TOKEN to allow remote changes.",
+            "Admin session or JWT required. No legacy admin token is configured.",
             "ADMIN_TOKEN_MISSING",
         )
-    return _admin_error("Unauthorized. Provide a valid admin token.", "ADMIN_AUTH_REQUIRED")
+    return _admin_error("Unauthorized. Provide a valid admin session or JWT.", "ADMIN_AUTH_REQUIRED")
 
 
 def validate_openrouter_base_url(base_url):
@@ -2191,6 +2782,232 @@ def _pdf_hex_color(value, fallback=None):
         return fallback
     raw = match.group(1)
     return tuple(int(raw[index:index + 2], 16) for index in (0, 2, 4))
+
+
+def _study_pdf_plain(value):
+    """Strip lightweight Markdown decorators without changing the wording."""
+    text = _strip_emphasis_markers(value)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    return text.strip()
+
+
+def _safe_study_pdf_name(value, fallback="NotesAI-Study-Pack.pdf"):
+    name = _clean_pdf_text(value) or fallback
+    name = re.sub(r'[\\/:*?"<>|]+', '-', name)
+    name = re.sub(r"\s+", " ", name).strip()[:110] or fallback
+    return name if name.lower().endswith(".pdf") else name + ".pdf"
+
+
+def generate_study_pdf(result_text, title="NotesAI Study Pack", subtitle="", language="English"):
+    """Render an AI Study result as a clean, printable Royal Blue PDF."""
+    fonts = resolve_pdf_fonts()
+    rtl = text_is_rtl_dominant(" ".join([str(title or ""), str(language or ""), str(result_text or "")[:800]]))
+    margin = 16
+
+    class StudyPDF(WatermarkedFPDF):
+        def footer(self):
+            if self.y < 26:
+                return
+            self.set_y(-14)
+            self.set_font("NotesAI", size=7.5)
+            self.set_text_color(120, 130, 150)
+            self.cell(0, 5, shape_text_for_pdf("NotesAI · Study export"),
+                      align="R" if rtl else "L")
+            self.set_xy(margin, -14)
+            self.cell(0, 5, "Page %d" % self.page_no(),
+                      align="L" if rtl else "R")
+            self.set_text_color(15, 23, 42)
+
+    pdf = StudyPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_margins(margin, 16, margin)
+    pdf.set_auto_page_break(True, margin=20)
+    register_pdf_fonts(pdf, fonts)
+    pdf.add_page()
+
+    # Royal Blue header band.
+    pdf.set_fill_color(30, 58, 138)
+    pdf.rect(0, 0, pdf.w, 30, "F")
+    pdf.set_xy(margin, 8)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("NotesAI", "B", size=15)
+    pdf.multi_cell(0, 8, shape_text_for_pdf(_clean_pdf_text(title)[:120]),
+                   align="R" if rtl else "L",
+                   new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_x(margin)
+    pdf.set_font("NotesAI", size=8.5)
+    pdf.multi_cell(0, 5, shape_text_for_pdf(_clean_pdf_text(subtitle)[:220]),
+                   align="R" if rtl else "L",
+                   new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_text_color(15, 23, 42)
+    pdf.ln(7)
+
+    in_code = False
+    for raw_line in _clean_pdf_text(result_text).split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if not stripped:
+            pdf.ln(2.2)
+            continue
+        if set(stripped) <= {"-", "_", "*"} and len(stripped) >= 3:
+            pdf.set_draw_color(203, 213, 225)
+            pdf.line(margin, pdf.get_y() + 1.5, pdf.w - margin, pdf.get_y() + 1.5)
+            pdf.ln(4)
+            continue
+
+        if in_code:
+            pdf.set_fill_color(248, 250, 252)
+            pdf.set_text_color(51, 65, 85)
+            pdf.set_font("NotesAI", size=9)
+            pdf.set_x(margin + 3)
+            pdf.multi_cell(0, 4.8, shape_text_for_pdf(_study_pdf_plain(line)),
+                           align="R" if rtl else "L", fill=True,
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(15, 23, 42)
+            continue
+
+        if stripped == "[[pagebreak]]":
+            pdf.add_page()
+            continue
+
+        heading = re.match(r"^(#{1,4})\s+(.*)$", stripped)
+        bullet = re.match(r"^\s*[-*+•]\s+(.*)$", stripped)
+        numbered = re.match(r"^\s*(\d+)[.)]\s+(.*)$", stripped)
+        quote = re.match(r"^\s*>\s?(.*)$", stripped)
+        checkbox = re.match(r"^\s*\[([ xX✓])\]\s+(.*)$", stripped)
+
+        if checkbox:
+            marker = "[x] " if checkbox.group(1).strip() else "[ ] "
+            pdf.set_font("NotesAI", size=10)
+            pdf.set_x(margin + 3)
+            pdf.multi_cell(0, 5.2, shape_text_for_pdf(marker + _study_pdf_plain(checkbox.group(2))),
+                           align="R" if rtl else "L",
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            continue
+
+        if heading:
+            level = len(heading.group(1))
+            size = {1: 14, 2: 12.5, 3: 11.5, 4: 10.5}.get(level, 11)
+            pdf.set_font("NotesAI", "B", size=size)
+            pdf.set_text_color(30, 58, 138)
+            pdf.multi_cell(0, size * 0.55, shape_text_for_pdf(_study_pdf_plain(heading.group(2))),
+                           align="R" if rtl else "L",
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(15, 23, 42)
+            pdf.ln(2.2)
+            continue
+
+        if bullet or numbered:
+            marker = "• " if bullet else (numbered.group(1) + ". ")
+            value = bullet.group(1) if bullet else numbered.group(2)
+            pdf.set_font("NotesAI", size=10)
+            pdf.set_x(margin + 3)
+            pdf.multi_cell(0, 5.2, shape_text_for_pdf(marker + _study_pdf_plain(value)),
+                           align="R" if rtl else "L",
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            continue
+
+        if quote:
+            pdf.set_text_color(100, 116, 139)
+            pdf.set_font("NotesAI", size=9.6)
+            pdf.set_x(margin + 4)
+            pdf.multi_cell(0, 5, shape_text_for_pdf(_study_pdf_plain(quote.group(1))),
+                           align="R" if rtl else "L",
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(15, 23, 42)
+            continue
+
+        pdf.set_font("NotesAI", size=10)
+        pdf.multi_cell(0, 5.2, shape_text_for_pdf(_study_pdf_plain(stripped)),
+                       align="R" if rtl else "L",
+                       new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    output = pdf.output()
+    if isinstance(output, str):
+        output = output.encode("latin-1")
+    return bytes(output)
+
+
+def generate_planner_pdf(planner, language="English"):
+    """Render a saved exam planner through the existing NotesAI PDF stack."""
+    record = planner or {}
+    schedule = record.get("schedule") or {}
+    progress = record.get("progress") or _planner_blank_progress()
+    summary = _planner_progress_summary(schedule, progress)
+    exam_name = _clean_planner_text(record.get("exam_name") or record.get("title"), 200) or "Exam Planner"
+    exam_date = _clean_planner_text(record.get("exam_date"), 20) or "—"
+    hours = record.get("daily_hours")
+    hours_text = ("%g" % float(hours)) if hours is not None else "—"
+
+    lines = [
+        "# " + exam_name,
+        "Exam date: " + exam_date,
+        "Remaining preparation days: %s" % (record.get("days_remaining") or len(schedule.get("days") or [])),
+        "Daily study hours: " + hours_text,
+        "",
+        "## Progress",
+        "- Total study days: %d" % summary["total_days"],
+        "- Completed days: %d" % summary["completed_days"],
+        "- Pending days: %d" % summary["pending_days"],
+        "- Completed topics: %d" % summary["completed_topics"],
+        "- Remaining topics: %d" % summary["remaining_topics"],
+        "- Overall completion: %d%%" % summary["overall_percent"],
+        "",
+    ]
+    warnings = _planner_string_list(schedule.get("warnings"), 20, 300)
+    if warnings:
+        lines.append("## Planning notes")
+        lines.extend("- " + warning for warning in warnings)
+        lines.append("")
+
+    completed = progress.get("completed") if isinstance(progress.get("completed"), dict) else {}
+    for day in schedule.get("days") or []:
+        lines.append("[[pagebreak]]")
+        lines.append("## DAY %s - %s, %s" % (
+            day.get("day_number"), day.get("weekday") or "", day.get("date") or ""
+        ))
+        minutes = int(day.get("daily_duration_minutes") or 0)
+        lines.append("Study Duration: %d hours %d minutes" % (minutes // 60, minutes % 60))
+        if day.get("missed"):
+            lines.append("> Marked as missed")
+        for topic in day.get("topics") or []:
+            topic_id = str(topic.get("id") or "")
+            mark = "x" if completed.get(topic_id) else " "
+            lines.append("- [%s] %s - %s minutes" % (
+                mark, _clean_planner_text(topic.get("title"), 240),
+                topic.get("duration_minutes") or 0,
+            ))
+            for task in topic.get("tasks") or []:
+                lines.append("  - Task: " + _clean_planner_text(task, 300))
+            for revision in topic.get("revision") or []:
+                lines.append("  - Revision: " + _clean_planner_text(revision, 300))
+            for practice in topic.get("practice_tests") or []:
+                lines.append("  - Practice: " + _clean_planner_text(practice, 300))
+            if topic.get("motivation"):
+                lines.append("  > " + _clean_planner_text(topic.get("motivation"), 300))
+        if day.get("revision"):
+            lines.append("### Quick revision")
+            lines.extend("- " + _clean_planner_text(item, 300) for item in day["revision"])
+        if day.get("practice_tests"):
+            lines.append("### Practice tests")
+            lines.extend("- " + _clean_planner_text(item, 300) for item in day["practice_tests"])
+        if day.get("motivation"):
+            lines.append("> " + _clean_planner_text(day.get("motivation"), 300))
+        lines.append("")
+
+    subtitle_parts = [exam_date]
+    if record.get("source_summary"):
+        subtitle_parts.append(_clean_planner_text(record.get("source_summary"), 180))
+    subtitle_parts.append(language or "English")
+    return generate_study_pdf(
+        "\n".join(lines),
+        title=_clean_planner_text(exam_name + " - Study Schedule", 120),
+        subtitle=" · ".join(subtitle_parts)[:220],
+        language=language or "English",
+    )
 
 
 def normalise_pdf_options(payload):
@@ -4521,20 +5338,6 @@ HTML = r"""
   } catch (error) {}
 })();
 </script>
-<script>
-  window.__ADMIN_TOKEN__ = {{ admin_token|tojson }};
-  (function() {
-    if (!window.__ADMIN_TOKEN__) return;
-    const _origFetch = window.fetch.bind(window);
-    window.fetch = function(input, init) {
-      init = init || {};
-      const headers = new Headers(init.headers || {});
-      if (!headers.has('X-Admin-Token')) headers.set('X-Admin-Token', window.__ADMIN_TOKEN__);
-      init.headers = headers;
-      return _origFetch(input, init);
-    };
-  })();
-</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -4940,6 +5743,66 @@ html { scroll-behavior: smooth; }
   transform: translateY(-1px);
 }
 
+.btn-danger {
+  background: var(--white);
+  color: #b91c1c;
+  border-color: #fecaca;
+  box-shadow: var(--shadow-sm);
+}
+.btn-danger:hover:not(:disabled) {
+  background: #fef2f2;
+  border-color: #ef4444;
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+[hidden] { display: none !important; }
+
+.auth-modal { position: fixed; inset: 0; z-index: 600; background: rgba(15,23,42,.55); display: flex; align-items: center; justify-content: center; padding: 20px; }
+.auth-card { width: min(430px, 100%); max-height: calc(100vh - 32px); overflow-y: auto; background: #fff; border-radius: 18px; padding: 24px; box-shadow: 0 20px 60px rgba(15,23,42,.3); font-family: inherit; color: #0f172a; }
+.auth-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; background: #f1f5f9; padding: 4px; border-radius: 12px; margin-bottom: 18px; }
+.auth-tab { padding: 9px 12px; border: 0; border-radius: 9px; background: transparent; color: #64748b; font: 600 12px/1 inherit; cursor: pointer; transition: color .15s ease, background .15s ease, box-shadow .15s ease; }
+.auth-tab.active { background: #fff; color: #1e3a8a; box-shadow: 0 2px 8px rgba(15,23,42,.1); }
+.auth-panel { transition: opacity .18s ease, transform .18s ease; }
+.auth-title { margin: 0 0 6px; font-size: 18px; }
+.auth-hint { margin: 0 0 16px; font-size: 11px; color: #64748b; line-height: 1.5; }
+.auth-field { margin-bottom: 12px; }
+.auth-label { display: block; margin-bottom: 6px; font-size: 11px; font-weight: 600; color: #475569; }
+.auth-input-wrap { position: relative; }
+.auth-input-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; display: grid; place-items: center; color: #94a3b8; pointer-events: none; }
+.auth-input-icon svg { width: 16px; height: 16px; }
+.auth-input { width: 100%; box-sizing: border-box; padding: 12px 14px; background: #f9fafb; border: 1px solid #e2e8f0; border-radius: 12px; font: inherit; font-size: 13px; color: #0f172a; outline: none; transition: border-color .15s ease, box-shadow .15s ease, background .15s ease; }
+.auth-input::placeholder { color: #94a3b8; }
+.auth-input.iconed { padding-left: 38px; }
+.auth-input.with-indicator { padding-right: 40px; }
+.auth-input:focus { background: #fff; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.14); }
+.auth-input.is-valid { border-color: #16a34a; }
+.auth-input.is-invalid { border-color: #dc2626; }
+.auth-row { display: flex; justify-content: flex-end; margin: -2px 0 14px; }
+.auth-link { border: 0; background: none; color: #1e3a8a; font: 600 11px/1 inherit; cursor: pointer; padding: 0; }
+.auth-link:hover { text-decoration: underline; }
+.auth-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; }
+.auth-btn { padding: 10px 16px; border: 0; border-radius: 10px; background: linear-gradient(135deg, #1e3a8a, #2563eb); color: #fff; font: 600 12px/1 inherit; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; }
+.auth-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(30,58,138,.28); }
+.auth-btn:disabled { opacity: .6; cursor: not-allowed; }
+.auth-btn.secondary { background: #fff; color: #0f172a; border: 1px solid #cbd5e1; box-shadow: none; }
+.auth-btn.wide { width: 100%; padding: 12px 16px; margin-top: 4px; }
+.auth-msg { margin: 12px 0 0; font-size: 12px; min-height: 16px; color: #b91c1c; }
+.auth-msg.ok { color: #15803d; }
+.auth-indicator { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font-size: 13px; line-height: 1; }
+.auth-indicator.ok { color: #16a34a; }
+.auth-indicator.error { color: #dc2626; }
+.auth-inline-error { margin: 5px 0 0; font-size: 10.5px; color: #dc2626; }
+.auth-rules { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 8px; margin-top: 7px; }
+.auth-rule { display: flex; align-items: center; gap: 5px; font-size: 10.5px; transition: color .15s ease; }
+.auth-rule.unmet { color: #64748b; }
+.auth-rule.unmet .auth-rule-icon { color: #dc2626; }
+.auth-rule.met { color: #15803d; }
+.auth-rule.met .auth-rule-icon { color: #16a34a; }
+.auth-rule-icon { width: 14px; flex: 0 0 14px; text-align: center; }
+@keyframes authShake { 0%, 100% { transform: translateX(0); } 20%, 60% { transform: translateX(-5px); } 40%, 80% { transform: translateX(5px); } }
+.auth-input.auth-shake { animation: authShake .38s ease; border-color: #dc2626; }
+
 .btn-ghost {
   background: transparent;
   color: var(--text-secondary);
@@ -5190,8 +6053,7 @@ html { scroll-behavior: smooth; }
     max-width: 100%;
     /* Clear the fixed mobile menu button, then the bottom navigation and
        device home-indicator safe area. */
-    padding: 72px 14px calc(26px + var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px));
-    scroll-padding-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px));
+    padding: 72px 14px calc(26px + env(safe-area-inset-bottom, 0px));
   }
 }
 
@@ -5843,79 +6705,6 @@ html { scroll-behavior: smooth; }
 /* Footer */
 .footer { margin-top: 40px; padding: 24px 0; text-align: center; font-size: 11px; color: var(--text-muted); letter-spacing: 0.05em; border-top: 1px solid var(--border-light); }
 
-/* ============================================================
-   MOBILE BOTTOM NAVIGATION
-   ============================================================ */
-  content: '';
-  position: absolute;
-/* === Premium Mobile Bottom Navigation === */
-.mobile-nav {
-  display: block;
-  position: fixed;
-  bottom: 0; left: 0; right: 0;
-  height: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px));
-  background: var(--white);
-  border-top: 1px solid var(--border-light);
-  box-shadow: 0 -4px 32px rgba(15,23,42,0.1);
-  z-index: var(--z-fixed);
-  padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
-}
-.mobile-nav-inner {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  height: 100%;
-  max-width: 640px;
-  margin: 0 auto;
-}
-.mobile-nav-item {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 10px 2px;
-  color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 500;
-  transition: color var(--transition-base), background var(--transition-base);
-  position: relative;
-}
-.mobile-nav-item:hover { color: var(--text-secondary); background: var(--navy-50); }
-.mobile-nav-item.active {
-  color: var(--accent-primary);
-  background: var(--accent-light);
-}
-.mobile-nav-item.active::before {
-  content: "";
-  position: absolute;
-  top: 8px; left: 50%;
-  transform: translateX(-50%);
-  width: 28px; height: 3px;
-  background: var(--grad-primary);
-  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
-}
-.mobile-nav-icon {
-  width: 32px;
-  height: 28px;
-  padding: 4px 6px;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 18px;
-  transition: background var(--transition-base), color var(--transition-base), transform var(--transition-base);
-}
-.mobile-nav-item.active .mobile-nav-icon {
-  background: var(--accent-light);
-  color: var(--accent-primary);
-  transform: translateY(-2px);
-}
-.mobile-nav-text {
-  letter-spacing: 0.02em;
-  font-size: 10px;
-}
-@media (max-width: 640px) {
-  .mobile-nav { display: block; }
-}
 /* Floating Mobile Menu Button */
 .mobile-menu-btn {
   display: grid;
@@ -6071,6 +6860,16 @@ input, textarea, select { scroll-margin-bottom: 24px; }
   box-shadow: var(--shadow-sm);
 }
 .document-card:hover { box-shadow: var(--shadow-3d-hover); transform: translateY(-2px); }
+.document-card { position: relative; }
+.doc-select {
+  position: absolute; top: 10px; right: 10px; z-index: 2;
+  display: grid; place-items: center;
+  width: 26px; height: 26px;
+  border-radius: 8px; background: var(--white);
+  border: 1px solid var(--border-medium); box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+.doc-select input { width: 15px; height: 15px; margin: 0; accent-color: var(--royal-blue-600); cursor: pointer; }
 .document-thumb { width: 100%; height: 130px; border-radius: var(--radius-lg); background: var(--navy-100); object-fit: cover; margin-bottom: 10px; }
 .document-info { display: flex; flex-direction: column; gap: 6px; }
 .document-name { font-size: 14px; font-weight: 600; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -6442,7 +7241,7 @@ input, textarea, select { scroll-margin-bottom: 24px; }
 
 /* Focus visibility */
 :focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
-.sidebar a:focus-visible, .mobile-nav-item:focus-visible { outline-offset: -2px; }
+.sidebar a:focus-visible { outline-offset: -2px; }
 
 @keyframes orbPulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(30,58,138,0.26), 0 8px 20px rgba(30,58,138,0.20); transform: scale(1); }
@@ -6804,6 +7603,79 @@ input, textarea, select { scroll-margin-bottom: 24px; }
 .study-set small { display: block; color: var(--text-muted); font-size: 10px; margin: 2px 0 7px; }
 .study-set-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .study-set-actions button { font-size: 10px; padding: 5px 8px; }
+
+/* AI Exam Planner (Advanced Mode only) */
+.simple-mode-active #examPlannerPanel { display: none; }
+.exam-planner-panel { margin-top: 18px; padding: 20px; border: 1px solid var(--glass-border); border-radius: var(--radius-lg); background: var(--glass-bg); backdrop-filter: var(--glass-blur); box-shadow: var(--shadow-md); animation: studyIn 0.35s var(--transition-bounce); }
+.planner-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
+.planner-head h4 { font-size: 17px; margin: 2px 0 4px; color: var(--text-primary); }
+.planner-head p { font-size: 12px; color: var(--text-muted); margin: 0; line-height: 1.6; }
+.planner-badge { display: inline-flex; align-items: center; padding: 5px 9px; border-radius: 999px; background: var(--royal-blue); color: #fff; font-size: 9px; font-weight: 800; letter-spacing: .09em; }
+.planner-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.planner-field label { display: block; margin-bottom: 6px; font-size: 11px; font-weight: 700; color: var(--text-muted); }
+.planner-field .form-input, .planner-field .form-select { font-size: 13px; padding: 10px 12px; }
+.planner-hint { display: block; margin-top: 5px; font-size: 10.5px; color: var(--text-muted); line-height: 1.5; }
+.planner-source-block { margin-top: 16px; padding: 14px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--white); }
+.planner-source-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
+.planner-source-head strong { font-size: 11px; color: var(--royal-blue); }
+.planner-doc-select { width: 100%; min-height: 96px; padding: 8px 10px; border: 1px solid var(--border-medium); border-radius: var(--radius-md); background: var(--white); color: var(--text-primary); font-size: 12px; }
+.planner-notes { min-height: 110px; margin-top: 4px; }
+.planner-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.planner-actions button { font-size: 11px; padding: 8px 11px; }
+.planner-status { min-height: 16px; margin: 10px 0 0; font-size: 11px; color: var(--text-muted); line-height: 1.5; }
+.planner-status.is-error { color: #b91c1c; font-weight: 600; }
+.planner-empty, .planner-empty-state { margin-top: 12px; padding: 14px; border: 1px dashed var(--border-medium); border-radius: var(--radius-md); background: var(--glass-bg-strong); color: var(--text-muted); font-size: 12px; text-align: center; line-height: 1.6; }
+.planner-empty-state strong { display: block; color: var(--text-primary); margin-bottom: 4px; }
+.planner-dashboard { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+.planner-stat { padding: 12px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--white); }
+.planner-stat span { display: block; font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: var(--text-muted); }
+.planner-stat strong { display: block; margin-top: 5px; font-size: 21px; line-height: 1.1; color: var(--royal-blue); }
+.planner-timeline { position: relative; display: flex; flex-direction: column; gap: 14px; margin-top: 18px; padding-left: 24px; }
+.planner-timeline::before { content: ''; position: absolute; left: 7px; top: 6px; bottom: 6px; width: 2px; background: linear-gradient(180deg, var(--royal-blue), rgba(30,58,138,0.12)); border-radius: 2px; }
+.planner-day { position: relative; padding: 16px; border: 1px solid var(--border-light); border-radius: var(--radius-lg); background: var(--glass-bg-strong); box-shadow: var(--shadow-sm); }
+.planner-day::before { content: ''; position: absolute; left: -21px; top: 20px; width: 10px; height: 10px; border-radius: 50%; background: var(--royal-blue); box-shadow: 0 0 0 3px rgba(30,58,138,0.12); }
+.planner-day.is-complete::before { background: #16a34a; box-shadow: 0 0 0 3px rgba(22,163,74,0.14); }
+.planner-day.is-missed::before { background: #f59e0b; box-shadow: 0 0 0 3px rgba(245,158,11,0.16); }
+.planner-day-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.planner-day-number { display: inline-flex; padding: 5px 9px; border-radius: 999px; background: var(--navy-100); color: var(--royal-blue); font-size: 10px; font-weight: 800; letter-spacing: .05em; }
+.planner-day-head > div { flex: 1; min-width: 160px; }
+.planner-day-head strong { display: block; font-size: 13px; }
+.planner-day-head small { display: block; margin-top: 2px; font-size: 10.5px; color: var(--text-muted); }
+.planner-day-status { padding: 4px 8px; border-radius: 999px; background: var(--navy-100); color: var(--text-muted); font-size: 9.5px; font-weight: 700; }
+.planner-day.is-complete .planner-day-status { background: #dcfce7; color: #166534; }
+.planner-day.is-missed .planner-day-status { background: #fef3c7; color: #92400e; }
+.planner-day-progress { position: relative; height: 6px; margin: 12px 0 10px; border-radius: 999px; background: var(--navy-100); overflow: hidden; }
+.planner-day-progress span { display: block; height: 100%; border-radius: 999px; background: var(--royal-blue); }
+.planner-day-progress em { position: absolute; right: 0; top: -18px; font-size: 9.5px; font-style: normal; color: var(--text-muted); }
+.planner-topic-list { list-style: none; padding: 0; margin: 0; }
+.planner-topic-list li { padding: 8px 0; border-top: 1px solid var(--border-light); }
+.planner-topic-list li:first-child { border-top: 0; }
+.planner-topic { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; cursor: pointer; }
+.planner-topic input { width: 16px; height: 16px; accent-color: var(--royal-blue); }
+.planner-topic span { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.planner-topic small { font-size: 10px; color: var(--text-muted); white-space: nowrap; }
+.planner-topic.is-done span { text-decoration: line-through; color: var(--text-muted); }
+.planner-topic-detail { margin: 4px 0 0 24px; font-size: 10.5px; line-height: 1.6; color: var(--text-muted); }
+.planner-day-actions { margin-top: 10px; }
+.planner-day-actions button { font-size: 10px; padding: 5px 8px; }
+.planner-warnings, .planner-preview { margin-top: 14px; padding: 12px 14px; border: 1px solid rgba(245,158,11,0.35); border-radius: var(--radius-md); background: rgba(254,243,199,0.55); color: #78350f; font-size: 11.5px; line-height: 1.6; }
+.planner-preview p { margin: 4px 0; }
+.planner-saved-section { margin-top: 18px; }
+.planner-saved { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.planner-saved-item { padding: 11px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--white); }
+.planner-saved-item strong { display: block; font-size: 12px; }
+.planner-saved-item small { display: block; margin: 2px 0 8px; font-size: 10px; color: var(--text-muted); }
+@media (max-width: 720px) {
+  .planner-grid { grid-template-columns: 1fr; }
+  .planner-dashboard { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .planner-day-head > div { min-width: 100%; }
+}
+@media print {
+  .planner-actions, .planner-source-block, .planner-inputs, .planner-saved-section,
+  .planner-preview, .planner-empty-state, .planner-status { display: none !important; }
+  .exam-planner-panel { border: 0; box-shadow: none; padding: 0; margin: 0; }
+  .planner-day { break-inside: avoid; box-shadow: none; }
+}
 .admin-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 14px 0 20px; }
 .admin-stat { padding: 15px; border: 1px solid var(--border-light); border-radius: var(--radius-lg); background: var(--white); }
 .admin-stat span { display: block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); }
@@ -7096,6 +7968,33 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
   .ab-13__btn { padding: 8px 16px; font-size: 12px; }
   .ab-13__icon { width: 16px; height: 16px; }
 }
+
+/* Guest mode banner — browsing is free, actions require an account. */
+.guest-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 18px; padding: 10px 14px;
+  border: 1px solid rgba(59,130,246,.28); border-radius: 14px;
+  background: linear-gradient(100deg, rgba(239,246,255,.98), rgba(219,234,254,.9));
+  color: var(--text-primary); font-size: 13px; line-height: 1.45;
+  box-shadow: 0 6px 18px rgba(30,58,138,.08);
+}
+.guest-banner-dot {
+  width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%;
+  background: var(--blue-600, #2563eb); box-shadow: 0 0 0 4px rgba(37,99,235,.14);
+}
+.guest-banner strong { color: var(--blue-700, #1d4ed8); font-weight: 700; }
+.guest-banner button {
+  margin-left: auto; padding: 7px 14px; border: 0; border-radius: 999px;
+  background: var(--blue-700, #1d4ed8); color: #fff;
+  font: 600 12px/1 inherit; cursor: pointer;
+  transition: transform .2s ease, box-shadow .2s ease;
+}
+.guest-banner button:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(30,58,138,.28); }
+@media (max-width: 640px) {
+  .guest-banner { gap: 8px; padding: 10px 12px; }
+  .guest-banner button { margin-left: 0; width: 100%; }
+}
+.notif-empty button { margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -7778,6 +8677,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
             <div class="smart-review-toolbar">
               <label for="diagramStyle">Diagram appearance</label>
               <select class="form-select" id="diagramStyle" data-tooltip="Choose how recreated diagrams are drawn">
+                <option value="universal" selected>Universal Clean Diagram</option>
                 <option value="color">Color Digital Diagram</option>
                 <option value="pencil">Pencil Sketch Diagram</option>
               </select>
@@ -7835,7 +8735,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         <button id="modeSimple" class="study-chip active" style="flex: 1;" data-mode="simple">Simple</button>
         <button id="modeAdvanced" class="study-chip" style="flex: 1;" data-mode="advanced">Advanced</button>
       </div>
-      <small id="studyModeHint" style="margin-top: 6px; color: var(--text-muted); font-size: 11px;">Simple: 4 actions | Advanced: 15 actions + diagrams</small>
+      <small id="studyModeHint" style="margin-top: 6px; color: var(--text-muted); font-size: 11px;">Simple: 4 actions | Advanced: 15 actions + Exam Planner</small>
       <small class="study-shortcut-hint">Shortcuts: Ctrl/⌘+Enter generate · Ctrl/⌘+K chat · Ctrl/⌘+S save · Alt+1/2 mode · Alt+F flip · Alt+N next · ? help</small>
     </div>
     
@@ -7899,6 +8799,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       <textarea class="study-notes" id="studyText" dir="auto" placeholder="Select a saved document above, or paste notes here. The AI will not invent facts outside this text."></textarea>
       <div class="upload-actions" style="margin-top:14px;">
         <button type="button" class="btn-3d btn-primary" id="studyGenerateBtn" data-tooltip="Generate a summary, key points and Q&amp;A from your notes"><svg class="btn-ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-spark"></use></svg> Generate study material</button>
+        <button type="button" class="btn-3d btn-secondary" id="studyExamPackBtn" data-tooltip="Build an exam-ready pack and download it as a printable PDF"><svg class="btn-ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-cards"></use></svg> Exam Pack PDF</button>
         <p id="studyStatus" role="status" aria-live="polite" style="font-size:12px;color:var(--text-muted);"></p>
       </div>
 
@@ -8005,6 +8906,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
             <button type="button" class="btn-3d btn-secondary" id="studyFormatBtn" aria-pressed="false" data-tooltip="Switch between formatted and raw text">Formatted</button>
             <button type="button" class="btn-3d btn-secondary" id="studyDownloadMdBtn" data-tooltip="Download the result as a Markdown file">.md</button>
             <button type="button" class="btn-3d btn-secondary" id="studyDownloadTxtBtn" data-tooltip="Download the result as a plain text file">.txt</button>
+            <button type="button" class="btn-3d btn-secondary" id="studyExportPdfBtn" data-tooltip="Download this study result as a clean printable PDF"><svg class="btn-ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-download"></use></svg> PDF</button>
             <button type="button" class="btn-3d btn-secondary" id="studyCopyBtn" data-tooltip="Copy the generated study material to your clipboard">Copy</button>
             <button type="button" class="btn-3d btn-secondary study-speak-btn" id="studySpeakBtn" data-tooltip="Read the result aloud using your browser voice"><svg class="btn-ico" aria-hidden="true"><use href="#icon-volume"></use></svg> Read aloud</button>
             <button type="button" class="btn-3d btn-secondary" id="studySaveBtn" data-tooltip="Save this study material to your library">Save</button>
@@ -8013,6 +8915,84 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         </div>
         <div class="study-result-text formatted" id="studyResultText" dir="auto"></div>
       </div>
+
+      <section class="exam-planner-panel" id="examPlannerPanel" aria-labelledby="examPlannerTitle">
+        <div class="planner-head">
+          <div>
+            <div class="panel-eyebrow">ADVANCED MODE · EXAM PLANNER</div>
+            <h4 id="examPlannerTitle">AI Exam Planner</h4>
+            <p>Build a realistic, day-by-day revision schedule from your saved documents or pasted notes.</p>
+          </div>
+          <span class="planner-badge">AI SCHEDULE</span>
+        </div>
+
+        <div class="planner-grid planner-inputs">
+          <div class="planner-field">
+            <label class="form-label" for="plannerExamName">Exam name / subject *</label>
+            <input class="form-input" id="plannerExamName" type="text" maxlength="200" placeholder="Biology Final Examination" autocomplete="off" />
+          </div>
+          <div class="planner-field">
+            <label class="form-label" for="plannerExamDate">Exam date *</label>
+            <input class="form-input" id="plannerExamDate" type="date" />
+            <small class="planner-hint" id="plannerDaysLeft">Choose a future date to see the remaining days.</small>
+          </div>
+          <div class="planner-field">
+            <label class="form-label" for="plannerDailyHours">Daily study hours *</label>
+            <input class="form-input" id="plannerDailyHours" type="number" min="0.5" max="16" step="0.5" value="2" inputmode="decimal" />
+            <small class="planner-hint" id="plannerHoursHint">2 hours per day · 0 minutes</small>
+          </div>
+          <div class="planner-field">
+            <label class="form-label" for="plannerTitle">Schedule title</label>
+            <input class="form-input" id="plannerTitle" type="text" maxlength="200" placeholder="My revision plan" autocomplete="off" />
+            <small class="planner-hint">Saved to your account when you generate or save.</small>
+          </div>
+        </div>
+
+        <div class="planner-source-block">
+          <div class="planner-source-head">
+            <div class="panel-eyebrow">SOURCE MATERIAL</div>
+            <strong id="plannerDocCount">0 documents selected</strong>
+          </div>
+          <label class="form-label" for="plannerDocuments">Select saved documents</label>
+          <select class="planner-doc-select" id="plannerDocuments" multiple size="4" aria-label="Select saved documents"></select>
+          <div class="planner-empty" id="plannerDocEmpty" hidden>No saved documents yet. Paste notes below, or add a document in PDF Studio.</div>
+          <label class="form-label" for="plannerNotes" style="margin-top:12px;">Paste notes</label>
+          <textarea class="study-notes planner-notes" id="plannerNotes" maxlength="50000" dir="auto" placeholder="Paste your chapter notes here. You can also select saved documents above and combine both."></textarea>
+          <small class="planner-hint" id="plannerNotesCount">0 / 50,000 characters</small>
+        </div>
+
+        <div class="planner-actions">
+          <button type="button" class="btn-3d btn-primary" id="plannerGenerateBtn">Generate Study Schedule</button>
+          <button type="button" class="btn-3d btn-secondary" id="plannerSaveBtn" disabled>Save Schedule</button>
+          <button type="button" class="btn-3d btn-secondary" id="plannerExportPdfBtn" disabled>Export as PDF</button>
+          <button type="button" class="btn-3d btn-secondary" id="plannerPrintBtn" disabled>Print Schedule</button>
+          <button type="button" class="btn-3d btn-secondary" id="plannerAdjustBtn" disabled>Adjust My Schedule</button>
+          <button type="button" class="btn-3d btn-secondary" id="plannerToStudioBtn" disabled>Add to PDF Studio</button>
+        </div>
+        <p class="planner-status" id="plannerStatus" role="status" aria-live="polite"></p>
+
+        <div class="planner-dashboard" id="plannerDashboard" hidden>
+          <div class="planner-stat"><span>Total study days</span><strong id="plannerStatDays">0</strong></div>
+          <div class="planner-stat"><span>Completed days</span><strong id="plannerStatCompletedDays">0</strong></div>
+          <div class="planner-stat"><span>Pending days</span><strong id="plannerStatPendingDays">0</strong></div>
+          <div class="planner-stat"><span>Completed topics</span><strong id="plannerStatCompletedTopics">0</strong></div>
+          <div class="planner-stat"><span>Remaining topics</span><strong id="plannerStatRemainingTopics">0</strong></div>
+          <div class="planner-stat"><span>Overall completion</span><strong id="plannerStatOverall">0%</strong></div>
+        </div>
+        <div class="planner-warnings" id="plannerWarnings" hidden></div>
+        <div class="planner-preview" id="plannerReschedulePreview" hidden></div>
+        <div class="planner-timeline" id="plannerTimeline"></div>
+        <div class="planner-empty-state" id="plannerEmptyState">
+          <strong>No schedule generated yet</strong>
+          <span>Add exam details and source material, then generate a real plan.</span>
+        </div>
+
+        <div class="planner-saved-section">
+          <h4 class="settings-title">Saved schedules</h4>
+          <div class="planner-saved" id="plannerSaved"></div>
+        </div>
+      </section>
+
       <div class="settings-section" style="margin-top:18px;">
         <h4 class="settings-title">Saved study sets</h4>
         <div class="saved-search-row">
@@ -8027,15 +9007,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       <div class="panel-header">
         <div class="panel-eyebrow">LOCAL ADMIN</div>
         <h3>Workspace overview</h3>
-        <p>Real data from this NotesAI workspace. Remote access requires the server admin token. No online payment gateway or cloud provider is claimed.</p>
-      </div>
-      <div class="admin-lock" id="adminLock" hidden>
-        <label class="form-label" for="adminPageToken">Admin token for remote access</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">
-          <input type="password" class="form-input" id="adminPageToken" placeholder="Optional on this device" autocomplete="off" style="flex:1 1 220px;">
-          <button type="button" class="btn-3d btn-secondary" id="adminReloadBtn">Reload</button>
-        </div>
-        <p style="font-size:11px;color:var(--text-muted);margin-top:6px;">The token is stored in this browser session only.</p>
+        <p>Real data from this NotesAI workspace. Remote access requires admin sign-in. No online payment gateway or cloud provider is claimed.</p>
       </div>
       <div class="admin-grid" id="adminStats">
         <div class="admin-stat"><span>Documents</span><strong id="adminDocs">—</strong><small>Stored PDFs</small></div>
@@ -8253,6 +9225,8 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         <input class="form-input" id="documentTagFilter" placeholder="Filter by tag (e.g. biology)…" aria-label="Filter by tag">
         <label class="toggle-row" style="margin:0;align-items:center;"><input type="checkbox" id="documentFavoriteFilter"> Favorites</label>
         <label class="toggle-row" style="margin:0;align-items:center;"><input type="checkbox" id="documentTrashFilter"> Trash</label>
+        <label class="toggle-row" style="margin:0;align-items:center;"><input type="checkbox" id="documentSelectAll"> Select all</label>
+        <button class="btn-3d btn-danger" id="documentDeleteSelected" type="button" hidden>Delete selected</button>
         <span class="toolbar-count" id="documentCount" aria-live="polite"></span>
       </div>
       <!-- My Notes Grid -->
@@ -8321,18 +9295,6 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         </div>
       </div>
       <div class="settings-section">
-        <h4 class="settings-title">Server Access</h4>
-        <div class="settings-grid">
-          <div class="setting-card">
-            <div class="setting-label">Admin Token (remote access only)</div>
-            <p class="setting-desc">Only required when this page is opened from another device. Must match <code>NOTESAI_ADMIN_TOKEN</code> on the server. Stored in this browser session only, never on the server.</p>
-            <input type="password" class="form-input setting-input" id="adminToken" placeholder="Optional admin token" autocomplete="off">
-            <small style="display:block;margin-top:8px;color:var(--text-muted);">Local access on this device does not require a token.</small>
-          </div>
-        </div>
-      </div>
-
-      <div class="settings-section">
         <h4 class="settings-title">Appearance</h4>
         <div class="settings-grid">
           <div class="setting-card">
@@ -8384,31 +9346,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
   {% endif %}
 </main>
 
-<!-- Mobile Bottom Navigation -->
-<nav class="mobile-nav" id="mobileNav" role="navigation" aria-label="Mobile navigation">
-  <div class="mobile-nav-inner">
-    <a class="mobile-nav-item {% if page == 'dashboard' %}active{% endif %}" href="/" data-page="dashboard"{% if page == 'dashboard' %} aria-current="page"{% endif %}>
-      <svg class="mobile-nav-icon" aria-hidden="true" focusable="false"><use href="#icon-home"></use></svg>
-      <span class="mobile-nav-text">Dashboard</span>
-    </a>
-    <a class="mobile-nav-item {% if page == 'study' %}active{% endif %}" href="/study" data-page="study"{% if page == 'study' %} aria-current="page"{% endif %}>
-      <svg class="mobile-nav-icon" aria-hidden="true" focusable="false"><use href="#icon-study"></use></svg>
-      <span class="mobile-nav-text">AI Study</span>
-    </a>
-    <a class="mobile-nav-item {% if page == 'new-order' %}active{% endif %}" href="/new-order" data-page="new-order"{% if page == 'new-order' %} aria-current="page"{% endif %}>
-      <svg class="mobile-nav-icon" aria-hidden="true" focusable="false"><use href="#icon-upload"></use></svg>
-      <span class="mobile-nav-text">PDF Studio</span>
-    </a>
-    <a class="mobile-nav-item {% if page == 'my-notes' %}active{% endif %}" href="/my-notes" data-page="my-notes"{% if page == 'my-notes' %} aria-current="page"{% endif %}>
-      <svg class="mobile-nav-icon" aria-hidden="true" focusable="false"><use href="#icon-notes"></use></svg>
-      <span class="mobile-nav-text">My Notes</span>
-    </a>
-    <a class="mobile-nav-item {% if page == 'settings' %}active{% endif %}" href="/settings" data-page="settings"{% if page == 'settings' %} aria-current="page"{% endif %}>
-      <svg class="mobile-nav-icon" aria-hidden="true" focusable="false"><use href="#icon-settings"></use></svg>
-      <span class="mobile-nav-text">Settings</span>
-    </a>
-  </div>
-</nav>
+
 
 <!-- PDF Preview Modal -->
 <div class="modal-backdrop" id="pdfPreviewModal" role="dialog" aria-modal="true" aria-labelledby="pdfPreviewTitle" aria-hidden="true">
@@ -8558,6 +9496,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
   let documentPage = 1;
   let documentPageSize = 8;
   let documentShowTrash = false;
+  const selectedDocIds = new Set();
   let activeDocument = null;
   let lastPdfFocus = null;
   const statTotal = document.getElementById('statTotal');
@@ -8583,7 +9522,6 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
   const testProviderBtn = document.getElementById('testProviderBtn');
   const providerTestStatus = document.getElementById('providerTestStatus');
   const providerHint = document.getElementById('providerHint');
-  const adminTokenInput = document.getElementById('adminToken');
   const pdfModeSelect = document.getElementById('pdfMode');
   const structuredPreview = document.getElementById('structuredPreview');
   const previewContent = document.getElementById('previewContent');
@@ -8685,19 +9623,20 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     }
   }
 
+  const UNIVERSAL_DIAGRAM_STYLE = ['universal', 'Universal Clean Diagram'];
   const DIAGRAM_STYLE_GROUPS = {
-    biology: [['pencil', 'Pencil Sketch'], ['medical', 'Colorful Medical Diagram']],
-    physics: [['vector', 'Clean Vector'], ['schematic', 'Schematic Style']],
-    chemistry: [['molecule2d', 'Molecule 2D'], ['structure3d', '3D Structure']],
-    geography: [['outline', 'Clean Outline'], ['topographic', 'Topographic']],
-    general: [['color', 'Color Digital Diagram'], ['pencil', 'Pencil Sketch Diagram']]
+    biology: [UNIVERSAL_DIAGRAM_STYLE, ['pencil', 'Pencil Sketch'], ['medical', 'Colorful Medical Diagram']],
+    physics: [UNIVERSAL_DIAGRAM_STYLE, ['vector', 'Clean Vector'], ['schematic', 'Schematic Style']],
+    chemistry: [UNIVERSAL_DIAGRAM_STYLE, ['molecule2d', 'Molecule 2D'], ['structure3d', '3D Structure']],
+    geography: [UNIVERSAL_DIAGRAM_STYLE, ['outline', 'Clean Outline'], ['topographic', 'Topographic']],
+    general: [UNIVERSAL_DIAGRAM_STYLE, ['color', 'Color Digital Diagram'], ['pencil', 'Pencil Sketch Diagram']]
   };
   const DIAGRAM_STYLE_LABELS = {
     biology: 'Biology / Anatomy', physics: 'Physics / Circuits',
     chemistry: 'Chemistry', geography: 'Geography / Maps', general: 'General diagram'
   };
   const DIAGRAM_STYLE_VALUES = new Set([
-    'color', 'pencil', '3d', 'simple', 'medical', 'vector', 'schematic',
+    'universal', 'color', 'pencil', '3d', 'simple', 'medical', 'vector', 'schematic',
     'molecule2d', 'structure3d', 'outline', 'topographic'
   ]);
 
@@ -8745,7 +9684,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
 
   function currentDiagramStyle() {
     const value = diagramStyleSelect ? diagramStyleSelect.value : 'color';
-    return DIAGRAM_STYLE_VALUES.has(value) ? value : 'color';
+    return DIAGRAM_STYLE_VALUES.has(value) ? value : 'universal';
   }
 
   // ----- Safe browser storage (private mode / blocked storage must not stop init) -----
@@ -8770,20 +9709,63 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     } catch (_) {}
   }
 
-  // ----- Admin token (only needed for remote access) -----
+  // ----- Auth: same-origin session cookies + CSRF + user JWT -----
+  function notesaiReadCookie(name) {
+    const prefix = encodeURIComponent(name) + '=';
+    const parts = document.cookie ? document.cookie.split(';') : [];
+    for (const part of parts) {
+      const item = part.trim();
+      if (item.startsWith(prefix)) return decodeURIComponent(item.slice(prefix.length));
+    }
+    return '';
+  }
+  function notesaiGetAccessToken() {
+    try { return sessionStorage.getItem('notesaiAccessToken') || ''; } catch (_) { return ''; }
+  }
+  function notesaiAuthHeaders(headers, url) {
+    const result = new Headers(headers || {});
+    const token = notesaiGetAccessToken();
+    if (token && !result.has('Authorization')) result.set('Authorization', 'Bearer ' + token);
+    let sameOrigin = true;
+    try { sameOrigin = new URL(String(url || location.href), location.href).origin === location.origin; } catch (_) {}
+    if (sameOrigin) {
+      const csrf = notesaiReadCookie('notesai_admin_csrf');
+      if (csrf && !result.has('X-CSRF-Token')) result.set('X-CSRF-Token', csrf);
+    }
+    return result;
+  }
   function adminHeaders() {
-    const headers = { 'Content-Type': 'application/json' };
-    const token = adminTokenInput ? adminTokenInput.value.trim() : '';
-    if (token) headers['X-Admin-Token'] = token;
+    const headers = notesaiAuthHeaders();
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
     return headers;
   }
-  if (adminTokenInput) {
-    const savedToken = storageGet('sessionStorage', 'notesaiAdminToken');
-    if (savedToken) adminTokenInput.value = savedToken;
-    adminTokenInput.addEventListener('change', () => {
-      const value = adminTokenInput.value.trim();
-      if (value) storageSet('sessionStorage', 'notesaiAdminToken', value);
-      else storageRemove('sessionStorage', 'notesaiAdminToken');
+
+  // ----- Guest-mode helpers (walled garden) -----
+  // Pages are public; data/actions are not. A 401 while there is no token is
+  // an expected guest state, not an application error.
+  function notesaiIsGuest() { return !notesaiGetAccessToken(); }
+  function notesaiIsGuestUnauthorized(res) {
+    return !!res && res.status === 401 && notesaiIsGuest();
+  }
+  function notesaiGuestEmptyState(kind, title, text, compact) {
+    const symbol = kind === 'activity' ? 'icon-empty-activity' : 'icon-empty-docs';
+    const widthStyle = compact ? '' : ' style="grid-column: 1 / -1; width: 100%;"';
+    return `
+      <div class="empty-state${compact ? ' compact' : ' enhanced'}"${widthStyle}>
+        <div class="empty-state-illustration" aria-hidden="true"><svg viewBox="0 0 64 64"><use href="#${symbol}"></use></svg></div>
+        <h4>${escapeHtml(title)}</h4>
+        <p>${escapeHtml(text)}</p>
+        <button type="button" class="btn-3d btn-primary" data-guest-auth>Sign In / Sign Up</button>
+      </div>`;
+  }
+  function notesaiBindGuestAuth(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('[data-guest-auth]').forEach(function (btn) {
+      if (btn.dataset && btn.dataset.guestBound) return;
+      if (btn.dataset) btn.dataset.guestBound = '1';
+      btn.addEventListener('click', function () {
+        if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
+      });
     });
   }
 
@@ -9424,7 +10406,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     const message = data && data.error ? String(data.error) : '';
     const code = data && data.code ? String(data.code) : '';
     if (status === 413) return 'File is too large. Each upload must be 20 MB or smaller.';
-    if (status === 401 || status === 403) return message || 'You are not allowed to do that. Check the admin token in Settings.';
+    if (status === 401 || status === 403) return message || 'Please sign in with an account that has access to this feature.';
     if (status === 429) return message || 'Too many requests. Please wait a moment and retry.';
     if (status === 409 || code === 'REQUEST_IN_PROGRESS') return message || 'This request is already running. Wait for it to finish, then retry.';
     if (code === 'PROVIDER_NOT_CONFIGURED') return message || 'Add an AI provider API key in Settings or the server .env, then retry.';
@@ -9488,11 +10470,9 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
           try { xhr.abort(); } catch (_) {}
         }, { once: true });
       }
-      // Auto-inject admin token for remote deployments (e.g. PythonAnywhere)
-      if (window.__ADMIN_TOKEN__ && !(options.headers && options.headers['X-Admin-Token'])) {
-        try { xhr.setRequestHeader('X-Admin-Token', window.__ADMIN_TOKEN__); } catch (_) {}
-      }
-      Object.entries(options.headers || {}).forEach(([key, value]) => {
+      xhr.withCredentials = true;
+      const reqHeaders = notesaiAuthHeaders(options.headers, url);
+      reqHeaders.forEach((value, key) => {
         try { xhr.setRequestHeader(key, value); } catch (_) {}
       });
       if (xhr.upload) {
@@ -9533,7 +10513,13 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return await fetch(url, { ...options, signal: controller.signal });
+      const authHeaders = notesaiAuthHeaders(options.headers, url);
+      return await fetch(url, {
+        ...options,
+        headers: authHeaders,
+        credentials: options.credentials || 'same-origin',
+        signal: controller.signal,
+      });
     } finally {
       clearTimeout(timer);
     }
@@ -9774,6 +10760,10 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     });
     try {
       const res = await fetchWithTimeout('/api/stats', { cache: 'no-store' }, 15000);
+      if (notesaiIsGuestUnauthorized(res)) {
+        statsEls.forEach(el => { if (el) el.textContent = '0'; });
+        return;
+      }
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       const values = [data.in_progress, data.completed, data.failed];
@@ -9842,6 +10832,10 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
 
     try {
       const res = await fetch('/api/plan', { cache: 'no-store' });
+      if (notesaiIsGuestUnauthorized(res)) {
+        applyFallback();
+        return;
+      }
       if (!res.ok) throw new Error('plan request failed');
       const data = await res.json();
       const limits = data.limits || {};
@@ -9881,6 +10875,23 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     if (dashboardActivity) renderCompactLoading(dashboardActivity, 'Loading activity');
     try {
       const res = await fetch('/api/activity');
+      if (notesaiIsGuestUnauthorized(res)) {
+        if (activityList) {
+          activityList.innerHTML = notesaiGuestEmptyState(
+            'activity', 'Sign in to see your activity',
+            'Your recent work will appear here once you sign in.', false
+          );
+          notesaiBindGuestAuth(activityList);
+        }
+        if (dashboardActivity) {
+          dashboardActivity.innerHTML = notesaiGuestEmptyState(
+            'activity', 'Sign in to see your activity',
+            'Your recent work will appear here once you sign in.', true
+          );
+          notesaiBindGuestAuth(dashboardActivity);
+        }
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         renderActivity(data);
@@ -9955,6 +10966,25 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     try {
       const url = documentShowTrash ? '/api/documents?trash=1' : '/api/documents';
       const res = await fetchWithTimeout(url, { cache: 'no-store' }, 30000);
+      if (notesaiIsGuestUnauthorized(res)) {
+        allDocuments = [];
+        if (documentGrid) {
+          documentGrid.innerHTML = notesaiGuestEmptyState(
+            'docs', 'Sign in to save your documents',
+            'Uploaded notes and PDFs stay in your private workspace.', false
+          );
+          notesaiBindGuestAuth(documentGrid);
+        }
+        if (dashboardRecent) {
+          dashboardRecent.innerHTML = notesaiGuestEmptyState(
+            'docs', 'Sign in to see your notes',
+            'Your recent documents will appear here.', true
+          );
+          notesaiBindGuestAuth(dashboardRecent);
+        }
+        [statTotal, statStorage, documentCount].forEach(el => { if (el) el.textContent = '0'; });
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         allDocuments = Array.isArray(data) ? data : [];
@@ -9984,6 +11014,16 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     renderListLoading(orderList, 'Loading order history');
     try {
       const res = await fetchWithTimeout('/api/orders', { cache: 'no-store' }, 30000);
+      if (notesaiIsGuestUnauthorized(res)) {
+        allOrders = [];
+        orderList.innerHTML = notesaiGuestEmptyState(
+          'docs', 'Sign in to see your orders',
+          'Your saved order history will appear here.', false
+        );
+        notesaiBindGuestAuth(orderList);
+        if (orderCount) orderCount.textContent = '0';
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         allOrders = Array.isArray(data) ? data : [];
@@ -10156,6 +11196,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
           <p>${inTrash ? 'Deleted documents appear here until you restore them.' : hasAny ? 'Try a different search term or filter.' : 'Create your first document from PDF Studio.'}</p>
         </div>
       `;
+      syncDocumentSelectionUI();
       return;
     }
     documentGrid.innerHTML = docs.map(d => {
@@ -10170,6 +11211,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       ].filter(Boolean).join('');
       return `
       <article class="document-card">
+        ${isDeleted ? '' : `<label class="doc-select" title="Select document"><input type="checkbox" data-doc-select value="${escapeHtml(d.id)}" ${selectedDocIds.has(d.id) ? 'checked' : ''} aria-label="Select ${escapeHtml(d.name)}"></label>`}
         ${d.thumbnail ? `<img src="${escapeHtml(d.thumbnail)}" alt="" class="document-thumb" loading="lazy">` : '<div class="document-thumb" style="display:grid;place-items:center;color:var(--text-muted);"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="width:30px;height:30px;"><use href="#icon-notes"></use></svg></div>'}
         <div class="document-info">
           <span class="document-name" title="${escapeHtml(d.name)}">${escapeHtml(d.name)}</span>
@@ -10185,10 +11227,53 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
           <button class="btn-3d btn-secondary" type="button" data-doc-action="details" data-doc-id="${escapeHtml(d.id)}">Details</button>
           ${isDeleted ? '' : `<button class="btn-3d btn-secondary" type="button" data-doc-action="download" data-doc-id="${escapeHtml(d.id)}">Download</button>`}
           ${isDeleted ? `<button class="btn-3d btn-primary" type="button" data-doc-action="restore" data-doc-id="${escapeHtml(d.id)}">Restore</button>` : canRegenerate ? `<button class="btn-3d btn-primary" type="button" data-doc-action="regenerate" data-doc-id="${escapeHtml(d.id)}">Regenerate</button>` : ''}
+          ${isDeleted ? '' : `<button class="btn-3d btn-danger" type="button" data-doc-action="delete" data-doc-id="${escapeHtml(d.id)}">Delete</button>`}
         </div>
       </article>
     `;
     }).join('');
+    syncDocumentSelectionUI();
+  }
+
+  function syncDocumentSelectionUI() {
+    const deleteBtn = document.getElementById('documentDeleteSelected');
+    const selectAll = document.getElementById('documentSelectAll');
+    const boxes = documentGrid ? Array.from(documentGrid.querySelectorAll('input[data-doc-select]:not(:disabled)')) : [];
+    if (deleteBtn) {
+      deleteBtn.hidden = selectedDocIds.size === 0;
+      deleteBtn.textContent = `Delete selected (${selectedDocIds.size})`;
+    }
+    if (selectAll) {
+      selectAll.disabled = boxes.length === 0;
+      selectAll.checked = boxes.length > 0 && boxes.every(box => selectedDocIds.has(box.value));
+      selectAll.indeterminate = boxes.some(box => selectedDocIds.has(box.value)) && !selectAll.checked;
+    }
+  }
+
+  async function deleteSelectedDocuments() {
+    if (!selectedDocIds.size) return;
+    const ids = Array.from(selectedDocIds);
+    if (!window.confirm(`Move ${ids.length} document(s) to trash? You can restore them later.`)) return;
+    const deleteBtn = document.getElementById('documentDeleteSelected');
+    setButtonLoading(deleteBtn, true);
+    let moved = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        const res = await fetch('/api/documents/' + encodeURIComponent(id), {
+          method: 'DELETE', headers: adminHeaders()
+        });
+        if (!res.ok) throw new Error('request failed');
+        moved += 1;
+      } catch (_) {
+        failed += 1;
+      }
+    }
+    selectedDocIds.clear();
+    syncDocumentSelectionUI();
+    setButtonLoading(deleteBtn, false);
+    showToast(`Moved ${moved} document(s) to trash.${failed ? ` ${failed} failed.` : ''}`, failed ? 'warning' : 'success');
+    fetchDocuments();
   }
 
   function openDocumentModal(id) {
@@ -10267,6 +11352,8 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Could not move the document to trash.');
+      if (activeDocument) selectedDocIds.delete(activeDocument.id);
+      syncDocumentSelectionUI();
       closeDocumentModal();
       showToast('Document moved to trash.', 'success');
       fetchDocuments();
@@ -11097,9 +12184,25 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     documentTrashFilter.addEventListener('change', () => {
       documentShowTrash = documentTrashFilter.checked;
       documentPage = 1;
+      selectedDocIds.clear();
+      syncDocumentSelectionUI();
       fetchDocuments();
     });
   }
+  const documentSelectAll = document.getElementById('documentSelectAll');
+  if (documentSelectAll) {
+    documentSelectAll.addEventListener('change', () => {
+      const boxes = documentGrid ? documentGrid.querySelectorAll('input[data-doc-select]:not(:disabled)') : [];
+      boxes.forEach(box => {
+        box.checked = documentSelectAll.checked;
+        if (box.checked) selectedDocIds.add(box.value);
+        else selectedDocIds.delete(box.value);
+      });
+      syncDocumentSelectionUI();
+    });
+  }
+  const documentDeleteSelected = document.getElementById('documentDeleteSelected');
+  if (documentDeleteSelected) documentDeleteSelected.addEventListener('click', deleteSelectedDocuments);
   if (documentPager) {
     documentPager.addEventListener('click', event => {
       const button = event.target.closest('[data-doc-page]');
@@ -11125,6 +12228,22 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
           restoreActiveDocument();
         }
       }
+      else if (action === 'delete') {
+        const doc = allDocuments.find(item => item.id === id);
+        if (doc) {
+          selectedDocIds.delete(id);
+          syncDocumentSelectionUI();
+          activeDocument = doc;
+          trashActiveDocument();
+        }
+      }
+    });
+    documentGrid.addEventListener('change', event => {
+      const box = event.target.closest('[data-doc-select]');
+      if (!box) return;
+      if (box.checked) selectedDocIds.add(box.value);
+      else selectedDocIds.delete(box.value);
+      syncDocumentSelectionUI();
     });
   }
   if (documentModal) {
@@ -11547,8 +12666,6 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     const toast = showToast('Regenerating your PDF…', 'processing', 0);
     try {
       const headers = {};
-      const token = adminTokenInput ? adminTokenInput.value.trim() : '';
-      if (token) headers['X-Admin-Token'] = token;
       const response = await fetchWithTimeout('/api/documents/' + encodeURIComponent(id) + '/regenerate', {
         method: 'POST',
         headers
@@ -11602,6 +12719,9 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
   // small namespace avoids duplicating toast, escaping or auth logic.
   window.notesaiShowToast = showToast;
   window.notesaiAdminHeaders = adminHeaders;
+  window.notesaiAuthHeaders = notesaiAuthHeaders;
+  window.notesaiGetAccessToken = notesaiGetAccessToken;
+  window.notesaiIsGuest = notesaiIsGuest;
   window.notesaiFormatDate = formatDate;
   window.notesaiFormatBytes = formatBytes;
   window.notesaiEscapeHtml = escapeHtml;
@@ -11773,19 +12893,15 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     if (typeof window.notesaiFormatBytes === 'function') return window.notesaiFormatBytes(value);
     return String(value || 0) + ' B';
   };
-  const adminHeaders = () => {
-    const headers = { 'Content-Type': 'application/json' };
-    const input = document.getElementById('adminPageToken');
-    let token = input ? input.value.trim() : '';
-    if (!token) {
-      try { token = sessionStorage.getItem('notesaiAdminToken') || ''; } catch (_) {}
-    }
-    if (token) headers['X-Admin-Token'] = token;
-    return headers;
-  };
+  const adminHeaders = () => (window.notesaiAdminHeaders ? window.notesaiAdminHeaders() : { 'Content-Type': 'application/json' });
   const requestJson = async (url, options = {}) => {
-    const response = await fetch(url, options);
+    const init = { ...options, credentials: options.credentials || 'same-origin' };
+    init.headers = window.notesaiAuthHeaders ? window.notesaiAuthHeaders(options.headers, url) : (options.headers || {});
+    const response = await fetch(url, init);
     const data = await response.json().catch(() => ({}));
+    if (response.status === 401) {
+      try { sessionStorage.removeItem('notesaiAccessToken'); } catch (_) {}
+    }
     if (!response.ok) {
       const error = new Error(data.error || ('Request failed with status ' + response.status));
       error.status = response.status;
@@ -11807,6 +12923,8 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     const prompt = document.getElementById('studyPrompt');
     const text = document.getElementById('studyText');
     const generateBtn = document.getElementById('studyGenerateBtn');
+    const examPackBtn = document.getElementById('studyExamPackBtn');
+    const exportPdfBtn = document.getElementById('studyExportPdfBtn');
     const status = document.getElementById('studyStatus');
     const resultBox = document.getElementById('studyResult');
     const resultText = document.getElementById('studyResultText');
@@ -11831,6 +12949,25 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     let savedSets = [];
     let resultFormatted = true;
     let resultRawText = '';
+
+    const studyPayload = () => ({
+      action: selectedAction,
+      document_id: sourceSelect ? sourceSelect.value : '',
+      document_ids: selectedDocIds(),
+      text: text ? text.value.trim() : '',
+      language: language ? language.value : 'English',
+      count: count ? count.value : 8,
+      prompt: prompt ? prompt.value : '',
+      save: false,
+    });
+    const hasStudySource = () => Boolean(
+      (sourceSelect && sourceSelect.value) || (text && text.value.trim())
+    );
+    const studyFileBase = () => {
+      const base = (resultTitle ? resultTitle.textContent : 'notesai-study')
+        .replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 80) || 'notesai-study';
+      return base;
+    };
 
     const setStatus = (message, isError = false) => {
       if (!status) return;
@@ -12040,9 +13177,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
 
     if (generateBtn) {
       generateBtn.addEventListener('click', async () => {
-        const documentId = sourceSelect ? sourceSelect.value : '';
-        const notes = text ? text.value.trim() : '';
-        if (!documentId && !notes) {
+        if (!hasStudySource()) {
           toast('Choose a document or paste some notes first.', 'warning');
           setStatus('Choose a document or paste some notes first.', true);
           return;
@@ -12054,16 +13189,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
           const data = await requestJson('/api/study/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: selectedAction,
-              document_id: documentId,
-              document_ids: selectedDocIds(),
-              text: notes,
-              language: language ? language.value : 'English',
-              count: count ? count.value : 8,
-              prompt: prompt ? prompt.value : '',
-              save: false,
-            }),
+            body: JSON.stringify(studyPayload()),
           });
           showStudy(data);
           toast('Study material ready.', 'success');
@@ -12073,6 +13199,39 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         } finally {
           generateBtn.disabled = false;
           generateBtn.innerHTML = '<svg class="btn-ico" aria-hidden="true"><use href="#icon-spark"></use></svg> Generate study material';
+        }
+      });
+    }
+
+    if (examPackBtn) {
+      examPackBtn.addEventListener('click', async () => {
+        if (!hasStudySource()) {
+          toast('Choose a document or paste some notes first.', 'warning');
+          setStatus('Choose a document or paste some notes first.', true);
+          return;
+        }
+        examPackBtn.disabled = true;
+        examPackBtn.textContent = 'Building Exam Pack…';
+        setStatus('Building your exam-ready pack…');
+        try {
+          const data = await requestJson('/api/study/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ...studyPayload(),
+              action: 'exam_pack',
+              prompt: (prompt ? prompt.value : '') + ' Make it compact and print-ready.',
+            }),
+          });
+          showStudy(data);
+          await downloadStudyPdf(data);
+          toast('Exam Pack downloaded as PDF.', 'success');
+        } catch (error) {
+          setStatus(error.message || 'Could not build the Exam Pack.', true);
+          toast(error.message || 'Could not build the Exam Pack.', 'error', 7000);
+        } finally {
+          examPackBtn.disabled = false;
+          examPackBtn.innerHTML = '<svg class="btn-ico" aria-hidden="true"><use href="#icon-cards"></use></svg> Exam Pack PDF';
         }
       });
     }
@@ -12103,8 +13262,54 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       toast('Downloaded ' + base + '.' + extension, 'success');
     };
+    const downloadStudyPdf = async (data) => {
+      const value = (data && data.result) || resultRawText || '';
+      if (!value) {
+        toast('Generate study material first.', 'warning');
+        return;
+      }
+      const response = await fetch('/api/study/export-pdf', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: adminHeaders(),
+        body: JSON.stringify({
+          result: value,
+          title: studyFileBase(),
+          action_label: (data && data.action_label) || 'Study material',
+          source_name: (data && data.source_name) || '',
+          language: (data && data.language) || (language ? language.value : 'English'),
+        }),
+      });
+      if (!response.ok) {
+        const info = await response.json().catch(() => ({}));
+        throw new Error(info.error || ('Could not create the PDF (HTTP ' + response.status + ').'));
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = studyFileBase() + '.pdf';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast('Downloaded ' + studyFileBase() + '.pdf', 'success');
+    };
+
     if (mdBtn) mdBtn.addEventListener('click', () => downloadResult('md', 'text/markdown;charset=utf-8'));
     if (txtBtn) txtBtn.addEventListener('click', () => downloadResult('txt', 'text/plain;charset=utf-8'));
+    if (exportPdfBtn) {
+      exportPdfBtn.addEventListener('click', async () => {
+        exportPdfBtn.disabled = true;
+        try {
+          await downloadStudyPdf(lastStudy);
+        } catch (error) {
+          toast(error.message || 'Could not export the study PDF.', 'error', 6000);
+        } finally {
+          exportPdfBtn.disabled = false;
+        }
+      });
+    }
 
     if (copyBtn) {
       copyBtn.addEventListener('click', async () => {
@@ -12939,29 +14144,18 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
   // ------------------------------------------------------------
   const adminPanel = document.getElementById('adminPanel');
   if (adminPanel) {
-    const tokenInput = document.getElementById('adminPageToken');
+    fetch('/api/admin/session', { credentials: 'same-origin' }).then(function (r) {
+      if (!r.ok && window.notesaiShowToast) {
+        window.notesaiShowToast('Admin sign-in required to manage this workspace.', 'error');
+      }
+    }).catch(function () {});
     const reloadBtn = document.getElementById('adminReloadBtn');
-    const lock = document.getElementById('adminLock');
     const planForm = document.getElementById('adminPlanForm');
     const planSelect = document.getElementById('adminPlanSelect');
     const renewal = document.getElementById('adminRenewal');
     const paymentForm = document.getElementById('adminPaymentForm');
     const backupBtn = document.getElementById('adminBackupBtn');
     let overview = null;
-
-    if (lock) lock.hidden = false;
-    if (tokenInput) {
-      try {
-        const saved = sessionStorage.getItem('notesaiAdminToken');
-        if (saved) tokenInput.value = saved;
-      } catch (_) {}
-      tokenInput.addEventListener('change', () => {
-        try {
-          if (tokenInput.value.trim()) sessionStorage.setItem('notesaiAdminToken', tokenInput.value.trim());
-          else sessionStorage.removeItem('notesaiAdminToken');
-        } catch (_) {}
-      });
-    }
 
     const setText = (id, value) => {
       const element = document.getElementById(id);
@@ -13054,8 +14248,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         renderAdmin(data);
       } catch (error) {
         if (error.status === 401 || error.status === 403) {
-          if (lock) lock.hidden = false;
-          toast('Admin token required for this remote session.', 'warning', 6500);
+                toast('Admin token required for this remote session.', 'warning', 6500);
         } else {
           toast(error.message || 'Could not load the admin overview.', 'error', 7000);
         }
@@ -13149,6 +14342,676 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     loadAdmin();
   }
 
+  // ------------------------------------------------------------
+  // AI Exam Planner (Advanced Mode)
+  // ------------------------------------------------------------
+  const plannerPanel = document.getElementById('examPlannerPanel');
+  if (plannerPanel) {
+    const pExamName = document.getElementById('plannerExamName');
+    const pDate = document.getElementById('plannerExamDate');
+    const pHours = document.getElementById('plannerDailyHours');
+    const pTitle = document.getElementById('plannerTitle');
+    const pDaysLeft = document.getElementById('plannerDaysLeft');
+    const pHoursHint = document.getElementById('plannerHoursHint');
+    const pNotes = document.getElementById('plannerNotes');
+    const pNotesCount = document.getElementById('plannerNotesCount');
+    const pDocs = document.getElementById('plannerDocuments');
+    const pDocCount = document.getElementById('plannerDocCount');
+    const pDocEmpty = document.getElementById('plannerDocEmpty');
+    const pGenerate = document.getElementById('plannerGenerateBtn');
+    const pSave = document.getElementById('plannerSaveBtn');
+    const pExport = document.getElementById('plannerExportPdfBtn');
+    const pPrint = document.getElementById('plannerPrintBtn');
+    const pAdjust = document.getElementById('plannerAdjustBtn');
+    const pStudio = document.getElementById('plannerToStudioBtn');
+    const pStatus = document.getElementById('plannerStatus');
+    const pDashboard = document.getElementById('plannerDashboard');
+    const pWarnings = document.getElementById('plannerWarnings');
+    const pPreview = document.getElementById('plannerReschedulePreview');
+    const pTimeline = document.getElementById('plannerTimeline');
+    const pEmpty = document.getElementById('plannerEmptyState');
+    const pSaved = document.getElementById('plannerSaved');
+
+    let currentPlanner = null;
+    let pendingReschedule = null;
+    let plannerBusy = false;
+
+    const isGuestPlanner = () => typeof window.notesaiIsGuest === 'function' && window.notesaiIsGuest();
+    const isGuestUnauthorized = error => !!error && Number(error.status) === 401 && isGuestPlanner();
+    const guestEmpty = (title, text) =>
+      '<div class="planner-empty-state"><strong>' + escapeHtml(title) + '</strong>' +
+      '<span>' + escapeHtml(text) + '</span>' +
+      '<button type="button" class="btn-3d btn-primary" data-guest-auth>Sign In / Sign Up</button></div>';
+
+    function localToday() {
+      const now = new Date();
+      return now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') +
+        '-' + String(now.getDate()).padStart(2, '0');
+    }
+
+    function daysBetween(from, to) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(from || '')) || !/^\d{4}-\d{2}-\d{2}$/.test(String(to || ''))) return null;
+      const start = new Date(String(from) + 'T00:00:00');
+      const end = new Date(String(to) + 'T00:00:00');
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+      return Math.round((end - start) / 86400000);
+    }
+
+    function hoursValue() {
+      const raw = pHours ? pHours.value : '';
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : NaN;
+    }
+
+    function selectedDocumentIds() {
+      if (!pDocs || !pDocs.selectedOptions) return [];
+      return Array.from(pDocs.selectedOptions).map(option => option.value).filter(Boolean);
+    }
+
+    function setPlannerStatus(message, isError) {
+      if (!pStatus) return;
+      pStatus.textContent = message || '';
+      pStatus.classList.toggle('is-error', !!isError);
+    }
+
+    function updatePlannerHints() {
+      if (pDaysLeft) {
+        const value = pDate ? pDate.value : '';
+        const days = value ? daysBetween(localToday(), value) : null;
+        if (!value) pDaysLeft.textContent = 'Choose a future date to see the remaining days.';
+        else if (days === null || days < 1) pDaysLeft.textContent = 'Exam date must be after today.';
+        else pDaysLeft.textContent = days + ' day' + (days === 1 ? '' : 's') + ' left · final preparation is ' +
+          (days === 1 ? 'today' : 'the day before the exam') + '.';
+      }
+      if (pHoursHint) {
+        const hours = hoursValue();
+        pHoursHint.textContent = Number.isFinite(hours)
+          ? hours + ' hour' + (hours === 1 ? '' : 's') + ' per day · ' + Math.round(hours * 60) + ' minutes'
+          : 'Choose between 0.5 and 16 hours.';
+      }
+      if (pNotesCount) {
+        const length = pNotes ? pNotes.value.length : 0;
+        pNotesCount.textContent = length.toLocaleString() + ' / 50,000 characters';
+      }
+      if (pDocCount) {
+        const count = selectedDocumentIds().length;
+        pDocCount.textContent = count + ' document' + (count === 1 ? '' : 's') + ' selected';
+      }
+    }
+
+    function plannerPayload(includeSchedule) {
+      const examName = pExamName ? pExamName.value.trim() : '';
+      const payload = {
+        exam_name: examName,
+        exam_date: pDate ? pDate.value : '',
+        daily_hours: hoursValue(),
+        today: localToday(),
+        title: (pTitle ? pTitle.value.trim() : '') || examName,
+        text: pNotes ? pNotes.value.trim() : '',
+        document_ids: selectedDocumentIds(),
+        language: 'English',
+      };
+      if (includeSchedule && currentPlanner) {
+        payload.schedule = currentPlanner.schedule || {};
+        payload.warnings = (currentPlanner.schedule && currentPlanner.schedule.warnings) || currentPlanner.warnings || [];
+      }
+      return payload;
+    }
+
+    function validatePlannerForm() {
+      if (!pExamName || !pExamName.value.trim()) {
+        setPlannerStatus('Enter an exam name or subject.', true);
+        pExamName.focus();
+        return false;
+      }
+      const value = pDate ? pDate.value : '';
+      const days = value ? daysBetween(localToday(), value) : null;
+      if (days === null || days < 1) {
+        setPlannerStatus('Choose an exam date after today.', true);
+        if (pDate) pDate.focus();
+        return false;
+      }
+      const hours = hoursValue();
+      if (!Number.isFinite(hours) || hours < 0.5 || hours > 16) {
+        setPlannerStatus('Daily study hours must be between 0.5 and 16.', true);
+        if (pHours) pHours.focus();
+        return false;
+      }
+      const ids = selectedDocumentIds();
+      if (!pNotes || !pNotes.value.trim()) {
+        if (!ids.length) {
+          setPlannerStatus('Paste notes or select at least one saved document.', true);
+          if (pNotes) pNotes.focus();
+          return false;
+        }
+      }
+      if (ids.length > 12) {
+        setPlannerStatus('Select at most 12 documents.', true);
+        return false;
+      }
+      setPlannerStatus('', false);
+      return true;
+    }
+
+    function enablePlannerActions(enabled) {
+      [pSave, pExport, pPrint, pAdjust, pStudio].forEach(button => {
+        if (button) button.disabled = !enabled;
+      });
+    }
+
+    function renderPlannerDashboard(summary) {
+      summary = summary || {};
+      const values = {
+        plannerStatDays: summary.total_days || 0,
+        plannerStatCompletedDays: summary.completed_days || 0,
+        plannerStatPendingDays: summary.pending_days || 0,
+        plannerStatCompletedTopics: summary.completed_topics || 0,
+        plannerStatRemainingTopics: summary.remaining_topics || 0,
+        plannerStatOverall: (summary.overall_percent || 0) + '%',
+      };
+      Object.keys(values).forEach(id => {
+        const element = document.getElementById(id);
+        if (element) element.textContent = values[id];
+      });
+      if (pDashboard) pDashboard.hidden = false;
+    }
+
+    function renderPlannerWarnings(planner) {
+      if (!pWarnings) return;
+      const schedule = planner.schedule || {};
+      const warnings = schedule.warnings || planner.warnings || [];
+      pWarnings.hidden = !warnings.length;
+      pWarnings.innerHTML = warnings.map(item =>
+        '<div>⚠ ' + escapeHtml(item) + '</div>'
+      ).join('');
+    }
+
+    function renderPlannerTimeline(planner) {
+      if (!pTimeline) return;
+      const schedule = planner.schedule || {};
+      const days = schedule.days || [];
+      const progress = planner.progress || {};
+      const completed = progress.completed && typeof progress.completed === 'object' ? progress.completed : {};
+      const dayStats = (planner.progress_summary && planner.progress_summary.days) || [];
+      if (!days.length) {
+        pTimeline.innerHTML = '';
+        if (pEmpty) pEmpty.hidden = false;
+        return;
+      }
+      pTimeline.innerHTML = days.map((day, index) => {
+        const stat = dayStats[index] || {};
+        const percent = Number(stat.percent || 0);
+        const status = stat.completed ? 'Completed' : stat.missed ? 'Missed' : 'Pending';
+        const classes = ['planner-day'];
+        if (stat.completed) classes.push('is-complete');
+        if (stat.missed) classes.push('is-missed');
+        const minutes = Number(day.daily_duration_minutes || 0);
+        const topics = (day.topics || []).map(topic => {
+          const topicId = String(topic.id || '');
+          const done = !!completed[topicId];
+          const details = []
+            .concat((topic.tasks || []).map(item => 'Task: ' + item))
+            .concat((topic.revision || []).map(item => 'Revision: ' + item))
+            .concat((topic.practice_tests || []).map(item => 'Practice: ' + item))
+            .map(item => '<div>' + escapeHtml(item) + '</div>')
+            .join('');
+          return '<li>' +
+            '<label class="planner-topic' + (done ? ' is-done' : '') + '">' +
+              '<input type="checkbox" data-planner-topic="' + escapeHtml(topicId) + '"' + (done ? ' checked' : '') + ' />' +
+              '<span>' + escapeHtml(topic.title || 'Topic') + '</span>' +
+              '<small>' + escapeHtml(topic.duration_minutes || 0) + ' min</small>' +
+            '</label>' +
+            (details ? '<div class="planner-topic-detail">' + details + '</div>' : '') +
+          '</li>';
+        }).join('');
+        const missedAction = stat.missed ? 'unmiss' : 'miss';
+        return '<article class="' + classes.join(' ') + '" data-day="' + escapeHtml(day.day_number) + '">' +
+          '<div class="planner-day-head">' +
+            '<span class="planner-day-number">DAY ' + escapeHtml(day.day_number) + '</span>' +
+            '<div><strong>' + escapeHtml(day.weekday || '') + ', ' + escapeHtml(day.date || '') + '</strong>' +
+            '<small>Study Duration: ' + Math.floor(minutes / 60) + ' hour' + (Math.floor(minutes / 60) === 1 ? '' : 's') +
+              ' ' + (minutes % 60) + ' minutes</small></div>' +
+            '<span class="planner-day-status">' + status + '</span>' +
+          '</div>' +
+          '<div class="planner-day-progress"><span style="width:' + percent + '%"></span><em>' + percent + '%</em></div>' +
+          '<ul class="planner-topic-list">' + topics + '</ul>' +
+          '<div class="planner-day-actions">' +
+            '<button type="button" class="btn-3d btn-secondary" data-planner-action="' + missedAction + '" data-day="' +
+              escapeHtml(day.day_number) + '">' + (stat.missed ? 'Unmark missed' : 'Mark missed') + '</button>' +
+          '</div>' +
+        '</article>';
+      }).join('');
+      if (pEmpty) pEmpty.hidden = true;
+    }
+
+    function showPlanner(planner, message) {
+      if (!planner) return;
+      currentPlanner = planner;
+      if (pExamName) pExamName.value = planner.exam_name || '';
+      if (pDate) pDate.value = planner.exam_date || '';
+      if (pHours) pHours.value = planner.daily_hours || 2;
+      if (pTitle) pTitle.value = planner.title || planner.exam_name || '';
+      renderPlannerDashboard(planner.progress_summary);
+      renderPlannerWarnings(planner);
+      renderPlannerTimeline(planner);
+      enablePlannerActions(true);
+      updatePlannerHints();
+      setPlannerStatus(message || 'Schedule ready.', false);
+    }
+
+    function clearCurrentPlanner(message) {
+      currentPlanner = null;
+      pendingReschedule = null;
+      enablePlannerActions(false);
+      if (pTimeline) pTimeline.innerHTML = '';
+      if (pDashboard) pDashboard.hidden = true;
+      if (pWarnings) pWarnings.hidden = true;
+      if (pPreview) pPreview.hidden = true;
+      if (pEmpty) pEmpty.hidden = false;
+      setPlannerStatus(message || '', false);
+    }
+
+    function renderReschedulePreview(preview) {
+      pendingReschedule = preview || null;
+      if (!pPreview) return;
+      if (!preview) {
+        pPreview.hidden = true;
+        pPreview.innerHTML = '';
+        return;
+      }
+      const days = (preview.schedule && preview.schedule.days) || [];
+      const warnings = preview.warnings || [];
+      pPreview.hidden = false;
+      pPreview.innerHTML =
+        '<strong>Reschedule preview</strong>' +
+        '<p>' + days.length + ' day' + (days.length === 1 ? '' : 's') + ' remaining · completed topics stay in place.</p>' +
+        warnings.map(item => '<p>⚠ ' + escapeHtml(item) + '</p>').join('') +
+        '<button type="button" class="btn-3d btn-primary" id="plannerApplyRescheduleBtn"' +
+        (preview.can_apply ? '' : ' disabled') + '>Apply updated schedule</button>';
+    }
+
+    function plannerMarkdown(planner) {
+      const schedule = planner.schedule || {};
+      const progress = planner.progress || {};
+      const completed = progress.completed || {};
+      const lines = [
+        '# ' + (planner.exam_name || 'Exam Planner'),
+        'Exam date: ' + (planner.exam_date || '—'),
+        'Remaining preparation days: ' + (planner.days_remaining || (schedule.days || []).length),
+        'Daily study hours: ' + (planner.daily_hours || '—'),
+        '',
+        '## Progress',
+        '- Completed topics: ' + ((planner.progress_summary || {}).completed_topics || 0),
+        '- Remaining topics: ' + ((planner.progress_summary || {}).remaining_topics || 0),
+        '- Overall completion: ' + ((planner.progress_summary || {}).overall_percent || 0) + '%',
+        '',
+      ];
+      (schedule.days || []).forEach(day => {
+        lines.push('## DAY ' + day.day_number + ' - ' + day.weekday + ', ' + day.date);
+        lines.push('Study Duration: ' + (day.daily_duration_minutes || 0) + ' minutes');
+        (day.topics || []).forEach(topic => {
+          lines.push('- [' + (completed[topic.id] ? 'x' : ' ') + '] ' + topic.title + ' - ' + topic.duration_minutes + ' minutes');
+          (topic.tasks || []).forEach(item => lines.push('  - Task: ' + item));
+          (topic.revision || []).forEach(item => lines.push('  - Revision: ' + item));
+          (topic.practice_tests || []).forEach(item => lines.push('  - Practice: ' + item));
+        });
+        if ((day.revision || []).length) {
+          lines.push('### Quick revision');
+          day.revision.forEach(item => lines.push('- ' + item));
+        }
+        if ((day.practice_tests || []).length) {
+          lines.push('### Practice tests');
+          day.practice_tests.forEach(item => lines.push('- ' + item));
+        }
+        lines.push('');
+      });
+      return lines.join('\n');
+    }
+
+    async function loadPlannerDocuments() {
+      if (!pDocs) return;
+      if (isGuestPlanner()) {
+        pDocs.innerHTML = '';
+        if (pDocEmpty) {
+          pDocEmpty.hidden = false;
+          pDocEmpty.innerHTML = guestEmpty('Sign in to choose documents', 'Your saved documents are private to your account.');
+        }
+        updatePlannerHints();
+        return;
+      }
+      try {
+        const data = await requestJson('/api/documents', { headers: adminHeaders() });
+        const documents = Array.isArray(data) ? data : (data.documents || []);
+        const previous = new Set(selectedDocumentIds());
+        pDocs.innerHTML = documents.map(document =>
+          '<option value="' + escapeHtml(document.id) + '">' + escapeHtml(document.name || 'Untitled document') + '</option>'
+        ).join('');
+        Array.from(pDocs.options).forEach(option => {
+          if (previous.has(option.value)) option.selected = true;
+        });
+        if (pDocEmpty) {
+          pDocEmpty.hidden = documents.length > 0;
+          pDocEmpty.textContent = 'No saved documents yet. Paste notes below, or add a document in PDF Studio.';
+        }
+      } catch (error) {
+        if (pDocEmpty) {
+          pDocEmpty.hidden = false;
+          if (isGuestUnauthorized(error)) {
+            pDocEmpty.innerHTML = guestEmpty('Sign in to choose documents', 'Your saved documents are private to your account.');
+          } else {
+            pDocEmpty.textContent = 'Could not load your documents. Please retry.';
+            if (!guest()) toast(error.message || 'Could not load documents.', 'error');
+          }
+        }
+      }
+      updatePlannerHints();
+    }
+
+    async function loadSavedPlanners() {
+      if (!pSaved) return;
+      if (isGuestPlanner()) {
+        pSaved.innerHTML = guestEmpty('Sign in to view saved schedules', 'Your schedules are stored privately in your account.');
+        return;
+      }
+      try {
+        const data = await requestJson('/api/planners', { headers: adminHeaders() });
+        const items = Array.isArray(data.planners) ? data.planners : [];
+        if (!items.length) {
+          pSaved.innerHTML = '<div class="planner-empty">No saved schedules yet. Generate one above to get started.</div>';
+          return;
+        }
+        pSaved.innerHTML = items.map(item =>
+          '<div class="planner-saved-item">' +
+            '<strong>' + escapeHtml(item.title || item.exam_name || 'Exam planner') + '</strong>' +
+            '<small>' + escapeHtml(item.exam_name || '') + ' · ' + escapeHtml(item.exam_date || '') +
+              ' · ' + escapeHtml((item.progress_summary || {}).overall_percent || 0) + '% complete</small>' +
+            '<div class="study-set-actions">' +
+              '<button type="button" class="btn-3d btn-secondary" data-planner-action="open" data-planner-id="' +
+                escapeHtml(item.id) + '">Open</button>' +
+              '<button type="button" class="btn-3d btn-destructive" data-planner-action="delete" data-planner-id="' +
+                escapeHtml(item.id) + '">Delete</button>' +
+            '</div>' +
+          '</div>'
+        ).join('');
+      } catch (error) {
+        if (isGuestUnauthorized(error)) {
+          pSaved.innerHTML = guestEmpty('Sign in to view saved schedules', 'Your schedules are stored privately in your account.');
+        } else {
+          pSaved.innerHTML = '<div class="planner-empty">Could not load saved schedules. Please retry.</div>';
+          if (!guest()) toast(error.message || 'Could not load saved schedules.', 'error');
+        }
+      }
+    }
+
+    if (pGenerate) {
+      pGenerate.addEventListener('click', async () => {
+        if (plannerBusy || !validatePlannerForm()) return;
+        plannerBusy = true;
+        const original = pGenerate.textContent;
+        pGenerate.disabled = true;
+        pGenerate.textContent = 'Generating schedule…';
+        setPlannerStatus('Reading your material and building a realistic schedule…', false);
+        try {
+          let data;
+          try {
+            data = await requestJson('/api/generate-planner', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(plannerPayload(false)),
+            });
+          } catch (error) {
+            if (Number(error.status) !== 409) throw error;
+            if (!window.confirm(error.message + '\n\nCreate a new schedule anyway?')) {
+              setPlannerStatus('Generation cancelled. Your existing schedule was not changed.', false);
+              return;
+            }
+            data = await requestJson('/api/generate-planner', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ...plannerPayload(false), confirm_new: true }),
+            });
+          }
+          showPlanner(data.planner, 'Schedule generated and saved to your account.');
+          toast('Study schedule ready.', 'success');
+          loadSavedPlanners();
+        } catch (error) {
+          if (isGuestUnauthorized(error)) {
+            setPlannerStatus('Sign in to generate a study schedule.', false);
+          } else {
+            setPlannerStatus(error.message || 'Could not generate a schedule.', true);
+            toast(error.message || 'Could not generate a schedule.', 'error', 7000);
+          }
+        } finally {
+          plannerBusy = false;
+          pGenerate.disabled = false;
+          pGenerate.textContent = original;
+        }
+      });
+    }
+
+    if (pSave) {
+      pSave.addEventListener('click', async () => {
+        if (!currentPlanner || !validatePlannerForm()) return;
+        pSave.disabled = true;
+        setPlannerStatus('Saving schedule…', false);
+        try {
+          const data = await requestJson('/api/planners/' + encodeURIComponent(currentPlanner.id), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(plannerPayload(true)),
+          });
+          showPlanner(data.planner, 'Schedule saved.');
+          toast('Schedule saved.', 'success');
+          loadSavedPlanners();
+        } catch (error) {
+          if (isGuestUnauthorized(error)) setPlannerStatus('Sign in to save a schedule.', false);
+          else {
+            setPlannerStatus(error.message || 'Could not save the schedule.', true);
+            toast(error.message || 'Could not save the schedule.', 'error', 7000);
+          }
+        } finally {
+          pSave.disabled = false;
+        }
+      });
+    }
+
+    if (pExport) {
+      pExport.addEventListener('click', async () => {
+        if (!currentPlanner) return;
+        pExport.disabled = true;
+        setPlannerStatus('Creating PDF…', false);
+        try {
+          const response = await fetch('/api/planners/' + encodeURIComponent(currentPlanner.id) + '/pdf', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: adminHeaders(),
+            body: JSON.stringify({ language: 'English' }),
+          });
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            if (response.status === 401 && isGuestPlanner()) {
+              setPlannerStatus('Sign in to export a schedule.', false);
+              return;
+            }
+            throw new Error(data.error || 'Could not export the schedule.');
+          }
+          const blob = await response.blob();
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = (currentPlanner.exam_name || 'Exam Planner').replace(/[\\/:*?"<>|]+/g, '-') + ' Schedule.pdf';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 3000);
+          setPlannerStatus('PDF downloaded.', false);
+          toast('Schedule PDF downloaded.', 'success');
+        } catch (error) {
+          setPlannerStatus(error.message || 'Could not create the PDF.', true);
+          toast(error.message || 'Could not create the PDF.', 'error', 7000);
+        } finally {
+          pExport.disabled = false;
+        }
+      });
+    }
+
+    if (pPrint) {
+      pPrint.addEventListener('click', () => {
+        if (currentPlanner) window.print();
+      });
+    }
+
+    if (pAdjust) {
+      pAdjust.addEventListener('click', async () => {
+        if (!currentPlanner) return;
+        pAdjust.disabled = true;
+        setPlannerStatus('Recalculating the remaining days…', false);
+        try {
+          const data = await requestJson('/api/planners/' + encodeURIComponent(currentPlanner.id) + '/reschedule', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ today: localToday(), apply: false }),
+          });
+          renderReschedulePreview(data.preview);
+          setPlannerStatus('Preview ready. Review it before applying.', false);
+        } catch (error) {
+          if (isGuestUnauthorized(error)) setPlannerStatus('Sign in to adjust a schedule.', false);
+          else {
+            setPlannerStatus(error.message || 'Could not reschedule this plan.', true);
+            toast(error.message || 'Could not reschedule this plan.', 'error', 7000);
+          }
+        } finally {
+          pAdjust.disabled = false;
+        }
+      });
+    }
+
+    if (pPreview) {
+      pPreview.addEventListener('click', async event => {
+        const button = event.target.closest('#plannerApplyRescheduleBtn');
+        if (!button || !currentPlanner || button.disabled) return;
+        button.disabled = true;
+        setPlannerStatus('Applying the updated schedule…', false);
+        try {
+          const data = await requestJson('/api/planners/' + encodeURIComponent(currentPlanner.id) + '/reschedule', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ today: localToday(), apply: true }),
+          });
+          renderReschedulePreview(null);
+          showPlanner(data.planner, 'Schedule updated. Your completed topics were preserved.');
+          toast('Schedule adjusted.', 'success');
+          loadSavedPlanners();
+        } catch (error) {
+          if (isGuestUnauthorized(error)) setPlannerStatus('Sign in to apply changes.', false);
+          else {
+            setPlannerStatus(error.message || 'Could not apply the new schedule.', true);
+            toast(error.message || 'Could not apply the new schedule.', 'error', 7000);
+          }
+          button.disabled = false;
+        }
+      });
+    }
+
+    if (pStudio) {
+      pStudio.addEventListener('click', () => {
+        if (!currentPlanner) return;
+        try { sessionStorage.setItem('notesaiStudyDraft', plannerMarkdown(currentPlanner)); } catch (_) {}
+        window.location.href = '/new-order';
+      });
+    }
+
+    if (pTimeline) {
+      pTimeline.addEventListener('change', async event => {
+        const box = event.target.closest('[data-planner-topic]');
+        if (!box || !currentPlanner) return;
+        const topicId = box.getAttribute('data-planner-topic');
+        try {
+          const data = await requestJson('/api/planners/' + encodeURIComponent(currentPlanner.id) + '/progress', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ topic_id: topicId, completed: box.checked }),
+          });
+          showPlanner(data.planner, box.checked ? 'Topic marked complete.' : 'Topic marked incomplete.');
+        } catch (error) {
+          box.checked = !box.checked;
+          if (isGuestUnauthorized(error)) setPlannerStatus('Sign in to save progress.', false);
+          else {
+            setPlannerStatus(error.message || 'Could not save progress.', true);
+            toast(error.message || 'Could not save progress.', 'error', 7000);
+          }
+        }
+      });
+
+      pTimeline.addEventListener('click', async event => {
+        const button = event.target.closest('[data-planner-action="miss"], [data-planner-action="unmiss"]');
+        if (!button || !currentPlanner) return;
+        const dayNumber = Number(button.getAttribute('data-day'));
+        const missed = button.getAttribute('data-planner-action') === 'miss';
+        button.disabled = true;
+        try {
+          const data = await requestJson('/api/planners/' + encodeURIComponent(currentPlanner.id) + '/progress', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ miss_day: dayNumber, missed }),
+          });
+          showPlanner(data.planner, missed ? 'Day marked as missed.' : 'Day unmarked.');
+          toast(missed ? 'Day marked as missed.' : 'Day unmarked.', 'success');
+        } catch (error) {
+          if (isGuestUnauthorized(error)) setPlannerStatus('Sign in to update this schedule.', false);
+          else {
+            setPlannerStatus(error.message || 'Could not update the day.', true);
+            toast(error.message || 'Could not update the day.', 'error', 7000);
+          }
+          button.disabled = false;
+        }
+      });
+    }
+
+    if (pSaved) {
+      pSaved.addEventListener('click', async event => {
+        const button = event.target.closest('[data-planner-action]');
+        if (!button) return;
+        const id = button.getAttribute('data-planner-id');
+        const action = button.getAttribute('data-planner-action');
+        if (!id || !/^[a-f0-9]{32}$/.test(id)) return;
+        button.disabled = true;
+        try {
+          if (action === 'open') {
+            const data = await requestJson('/api/planners/' + id, { headers: adminHeaders() });
+            showPlanner(data.planner, 'Saved schedule opened.');
+          } else if (action === 'delete') {
+            if (!window.confirm('Delete this saved schedule? This cannot be undone.')) return;
+            await requestJson('/api/planners/' + id, { method: 'DELETE', headers: adminHeaders() });
+            if (currentPlanner && currentPlanner.id === id) clearCurrentPlanner('Schedule deleted.');
+            toast('Schedule deleted.', 'success');
+            loadSavedPlanners();
+          }
+        } catch (error) {
+          if (isGuestUnauthorized(error)) setPlannerStatus('Sign in to manage saved schedules.', false);
+          else {
+            setPlannerStatus(error.message || 'Could not update saved schedules.', true);
+            toast(error.message || 'Could not update saved schedules.', 'error', 7000);
+          }
+        } finally {
+          button.disabled = false;
+        }
+      });
+    }
+
+    [pExamName, pDate, pHours, pNotes].forEach(element => {
+      if (element) {
+        element.addEventListener('input', updatePlannerHints);
+        element.addEventListener('change', updatePlannerHints);
+      }
+    });
+    if (pDocs) pDocs.addEventListener('change', updatePlannerHints);
+
+    updatePlannerHints();
+    loadPlannerDocuments();
+    loadSavedPlanners();
+  }
+
   // Move a generated study result into the PDF editor without a server round-trip.
   const editor = document.getElementById('extractedText');
   if (editor) {
@@ -13223,27 +15086,27 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         const modeAdvanced = document.getElementById('modeAdvanced');
         const studyActionsContainer = document.getElementById('studyActions');
         if (!modeSimple || !modeAdvanced || !studyActionsContainer) return;
-        
+
         const SIMPLE_ACTIONS = ['summarize', 'key_points', 'qa', 'flashcards'];
 
         if (!savedMode) {
             savedMode = 'simple';
             writeStore('notesaiStudyMode', savedMode);
         }
-        
+
         const currentMode = readStore('notesaiStudyMode', savedMode);
         setMode(currentMode);
-        
+
         modeSimple.addEventListener('click', function() {
             setMode('simple');
             writeStore('notesaiStudyMode', 'simple');
         });
-        
+
         modeAdvanced.addEventListener('click', function() {
             setMode('advanced');
             writeStore('notesaiStudyMode', 'advanced');
         });
-        
+
         function setMode(mode) {
             const chips = Array.from(studyActionsContainer.querySelectorAll('.study-chip'));
             const available = chips.map(chip => chip.getAttribute('data-action')).filter(Boolean);
@@ -13271,7 +15134,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
                 modeAdvanced.classList.remove('active');
             } else {
                 if (studyPanelEl) { studyPanelEl.classList.remove('simple-mode-active'); }
-                if (modeHintEl) { modeHintEl.textContent = `Advanced: ${chips.length} actions + diagrams`; }
+                if (modeHintEl) { modeHintEl.textContent = `Advanced: ${chips.length} actions + Exam Planner`; }
                 modeAdvanced.classList.add('active');
                 modeSimple.classList.remove('active');
             }
@@ -13327,7 +15190,14 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
   });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeTopbarMenus(); } });
   if (topbarLogoutBtn) {
-    topbarLogoutBtn.addEventListener('click', function (e) { e.preventDefault(); fetch('/api/auth/logout', { method: 'POST' }).catch(function () {}).finally(function () { window.location.href = '/'; }); });
+    topbarLogoutBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      const headers = window.notesaiAuthHeaders ? window.notesaiAuthHeaders({ 'Content-Type': 'application/json' }) : { 'Content-Type': 'application/json' };
+      fetch('/api/admin/logout', { method: 'POST', credentials: 'same-origin', headers }).catch(function () {});
+      fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin', headers }).catch(function () {});
+      try { sessionStorage.removeItem('notesaiAccessToken'); } catch (_) {}
+      window.location.href = '/';
+    });
   }
 
   /* ---- Real notifications ---- */
@@ -13404,6 +15274,16 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     }
     try {
       const res = await fetch('/api/notifications', { headers: { 'Accept': 'application/json' } });
+      if (notesaiIsGuestUnauthorized(res)) {
+        notifLoaded = true;
+        if (notifList) {
+          notifList.innerHTML = '<div class="notif-empty"><strong>Sign in to view notifications</strong>' +
+            '<p>Updates about your work will appear here.</p>' +
+            '<button type="button" class="btn-outline" data-guest-auth>Sign In / Sign Up</button></div>';
+          notesaiBindGuestAuth(notifList);
+        }
+        return;
+      }
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       const signature = JSON.stringify({ items: data.notifications, unread: data.unread });
@@ -13541,6 +15421,399 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       window.location.href = 'mailto:' + email;
     }
   });
+})();
+</script>
+<script>
+(function () {
+  if (window.__notesaiAuthModalReady) return;
+  window.__notesaiAuthModalReady = true;
+
+  function getToken() { try { return sessionStorage.getItem('notesaiAccessToken') || ''; } catch (_) { return ''; } }
+  function setToken(value) { try { sessionStorage.setItem('notesaiAccessToken', value); } catch (_) {} }
+  function clearToken() { try { sessionStorage.removeItem('notesaiAccessToken'); } catch (_) {} }
+  function isGuest() { return !getToken(); }
+
+  var ICON_USER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"></circle><path d="M4 21v-2a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v2"></path></svg>';
+  var ICON_MAIL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path></svg>';
+  var ICON_LOCK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"></rect><path d="M8 10V7a4 4 0 0 1 8 0v3"></path></svg>';
+
+  var btn = null;
+  var modal = null;
+
+  function close() {
+    if (modal && modal.parentNode) modal.parentNode.removeChild(modal);
+    modal = null;
+  }
+
+  function setMsg(el, text, ok) {
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'auth-msg' + (ok ? ' ok' : '');
+  }
+
+  function post(url, body) {
+    return fetch(url, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; });
+    });
+  }
+
+  function activate(mode) {
+    if (!modal) return;
+    modal.querySelectorAll('[data-auth-tab]').forEach(function (tab) {
+      var active = tab.getAttribute('data-auth-tab') === mode;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    modal.querySelectorAll('[data-panel]').forEach(function (panel) {
+      var active = panel.getAttribute('data-panel') === mode;
+      panel.hidden = !active;
+      if (active) {
+        panel.style.opacity = '0';
+        panel.style.transform = 'translateY(6px)';
+        requestAnimationFrame(function () {
+          panel.style.opacity = '1';
+          panel.style.transform = 'translateY(0)';
+        });
+      }
+    });
+    modal.querySelectorAll('[data-msg]').forEach(function (m) { setMsg(m, '', false); });
+  }
+
+  function finish(res) {
+    if (!res.ok || !res.data.access_token) throw new Error(res.data.error || 'Request failed');
+    setToken(res.data.access_token);
+    close();
+    window.location.reload();
+  }
+
+  function shake(el) {
+    if (!el) return;
+    el.classList.remove('auth-shake');
+    void el.offsetWidth;
+    el.classList.add('auth-shake');
+    setTimeout(function () { el.classList.remove('auth-shake'); }, 420);
+  }
+
+  function showFieldError(form, key, message) {
+    var el = form.querySelector('[data-' + key + '-error]');
+    if (!el) return;
+    el.textContent = message || '';
+    el.hidden = !message;
+  }
+
+  function clearFieldErrors(form) {
+    ['name', 'email', 'password'].forEach(function (key) { showFieldError(form, key, ''); });
+    var confirmError = form.querySelector('[data-confirm-error]');
+    if (confirmError) { confirmError.textContent = ''; confirmError.hidden = true; }
+  }
+
+  function passwordRuleStates(value) {
+    return {
+      length: value.length >= 8,
+      uppercase: /[A-Z]/.test(value),
+      lowercase: /[a-z]/.test(value),
+      number: /\d/.test(value)
+    };
+  }
+
+  function updatePasswordRules(form) {
+    var value = form.querySelector('[name="password"]').value;
+    var states = passwordRuleStates(value);
+    form.querySelectorAll('[data-rule]').forEach(function (row) {
+      var met = !!states[row.getAttribute('data-rule')];
+      row.classList.toggle('met', met);
+      row.classList.toggle('unmet', !met);
+      row.querySelector('.auth-rule-icon').textContent = met ? '✅' : '❌';
+    });
+    return Object.keys(states).every(function (key) { return states[key]; });
+  }
+
+  function updateConfirmMatch(form) {
+    var password = form.querySelector('[name="password"]').value;
+    var confirmInput = form.querySelector('[name="confirm_password"]');
+    var confirm = confirmInput.value;
+    var indicator = form.querySelector('[data-confirm-indicator]');
+    var error = form.querySelector('[data-confirm-error]');
+    if (!confirm) {
+      indicator.textContent = '';
+      indicator.className = 'auth-indicator';
+      confirmInput.classList.remove('is-valid', 'is-invalid');
+      error.hidden = true;
+      return false;
+    }
+    var matched = password === confirm;
+    indicator.textContent = matched ? '✅' : '❌';
+    indicator.className = 'auth-indicator ' + (matched ? 'ok' : 'error');
+    confirmInput.classList.toggle('is-valid', matched);
+    confirmInput.classList.toggle('is-invalid', !matched);
+    error.hidden = matched;
+    return matched;
+  }
+
+  function submitSignIn(form) {
+    var msg = form.querySelector('[data-msg]');
+    var email = form.querySelector('[name="email"]').value.trim();
+    var password = form.querySelector('[name="password"]').value;
+    var button = form.querySelector('[type="submit"]');
+    if (!email || !password) { setMsg(msg, 'Enter your email and password.'); shake(form.querySelector('[name="' + (!email ? 'email' : 'password') + '"]')); return; }
+    setMsg(msg, 'Signing in…', true);
+    button.disabled = true;
+    post('/api/auth/login', { email: email, password: password })
+      .then(finish)
+      .catch(function (err) { setMsg(msg, err.message || 'Sign in failed.'); })
+      .finally(function () { button.disabled = false; });
+  }
+
+  function submitSignUp(form) {
+    clearFieldErrors(form);
+    var nameInput = form.querySelector('[name="name"]');
+    var emailInput = form.querySelector('[name="email"]');
+    var passwordInput = form.querySelector('[name="password"]');
+    var confirmInput = form.querySelector('[name="confirm_password"]');
+    var name = nameInput.value.trim();
+    var email = emailInput.value.trim();
+    var passwordOk = updatePasswordRules(form);
+    var confirmOk = updateConfirmMatch(form);
+    var invalid = [];
+
+    if (!name) { showFieldError(form, 'name', 'Please enter your full name.'); invalid.push(nameInput); }
+    if (!email || !/^[^@]+@[^@]+\.[^@]+$/.test(email)) { showFieldError(form, 'email', 'Enter a valid email address.'); invalid.push(emailInput); }
+    if (!passwordOk) { showFieldError(form, 'password', 'Meet all password requirements.'); invalid.push(passwordInput); }
+    if (!confirmOk) invalid.push(confirmInput);
+
+    if (invalid.length) {
+      invalid.forEach(shake);
+      var first = invalid[0];
+      if (first) first.focus();
+      return;
+    }
+
+    var button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    post('/api/auth/register', { name: name, email: email, password: passwordInput.value })
+      .then(finish)
+      .catch(function (err) {
+        var message = err.message || 'Registration failed.';
+        if (/email/i.test(message)) { showFieldError(form, 'email', message); shake(emailInput); }
+        else if (/password|character|uppercase|lowercase|digit/i.test(message)) { showFieldError(form, 'password', message); shake(passwordInput); }
+        else { showFieldError(form, 'name', message); shake(nameInput); }
+      })
+      .finally(function () { button.disabled = false; });
+  }
+
+  function forgotPassword() {
+    var form = modal.querySelector('[data-panel="signin"]');
+    var email = form.querySelector('[name="email"]').value.trim();
+    var msg = form.querySelector('[data-msg]');
+    if (!email) {
+      setMsg(msg, 'Enter your email above first.');
+      form.querySelector('[name="email"]').focus();
+      return;
+    }
+    setMsg(msg, 'Sending reset link…', true);
+    post('/api/auth/forgot-password', { email: email })
+      .then(function (res) {
+        setMsg(msg, (res.data && res.data.message) || 'If that email exists, a reset link has been sent.', true);
+      })
+      .catch(function () { setMsg(msg, 'Could not send reset link. Please retry.'); });
+  }
+
+  // ----- Walled garden: guests may browse, but cannot run actions -----
+  // Capture-phase listeners run before the page's own handlers, so an
+  // unauthenticated click never reaches an upload/generate/delete API.
+  var GUEST_ACTION_SELECTOR = [
+    '#dropzone', '#extractBtn', '#generateBtn', '#previewPdfBtn',
+    '#studyGenerateBtn', '#studyExamPackBtn', '#studyExportPdfBtn',
+    '#plannerGenerateBtn', '#plannerSaveBtn', '#plannerExportPdfBtn',
+    '#plannerPrintBtn', '#plannerAdjustBtn', '#plannerApplyRescheduleBtn',
+    '#plannerToStudioBtn', '[data-planner-action="open"]',
+    '[data-planner-action="delete"]', '[data-planner-action="miss"]',
+    '[data-planner-action="unmiss"]',
+    '#chatSendBtn', '#fcGenerateBtn', '#quizGenerateBtn',
+    '#studySaveBtn', '#adminBackupBtn', '#testProviderBtn', '#notifMarkRead',
+    '#documentDeleteSelected', '#clearActivity', '#resetStats',
+    '[data-doc-action="download"]', '[data-doc-action="regenerate"]',
+    '[data-doc-action="delete"]', '[data-doc-action="restore"]',
+    '[data-diagram-action="preview"]', '[data-diagram-action="reconstruct"]',
+    '[data-guest-auth]'
+  ].join(',');
+  var GUEST_FORM_SELECTOR = 'form#uploadForm, form#chatForm, form#documentForm, form#adminPlanForm, form#adminPaymentForm';
+
+  function guestTarget(el) {
+    try { return el && el.closest ? el.closest(GUEST_ACTION_SELECTOR) : null; }
+    catch (_) { return null; }
+  }
+
+  function triggerGuestGate(e) {
+    if (!isGuest()) return;
+    if (e) {
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      if (typeof e.stopPropagation === 'function') e.stopPropagation();
+    }
+    open();
+    var target = e && e.target ? guestTarget(e.target) : null;
+    var isAuthCta = !!(target && target.hasAttribute && target.hasAttribute('data-guest-auth'));
+    if (!isAuthCta && typeof window.notesaiShowToast === 'function') {
+      window.notesaiShowToast('Please Sign Up or Sign In to use this feature.', 'info', 6000);
+    }
+  }
+
+  document.addEventListener('click', function (e) {
+    if (!isGuest() || !guestTarget(e.target)) return;
+    triggerGuestGate(e);
+  }, true);
+
+  document.addEventListener('submit', function (e) {
+    if (!isGuest() || !e.target || !e.target.matches || !e.target.matches(GUEST_FORM_SELECTOR)) return;
+    triggerGuestGate(e);
+  }, true);
+
+  document.addEventListener('keydown', function (e) {
+    if (!isGuest() || (e.key !== 'Enter' && e.key !== ' ')) return;
+    if (!guestTarget(e.target)) return;
+    triggerGuestGate(e);
+  }, true);
+
+  document.addEventListener('change', function (e) {
+    if (!isGuest() || !e.target || e.target.id !== 'noteFile') return;
+    try { e.target.value = ''; } catch (_) {}
+    triggerGuestGate(e);
+  }, true);
+
+  document.addEventListener('drop', function (e) {
+    if (!isGuest() || !guestTarget(e.target)) return;
+    triggerGuestGate(e);
+  }, true);
+
+  function open() {
+    if (modal) return;
+    modal = document.createElement('div');
+    modal.className = 'auth-modal';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.innerHTML = '' +
+      '<div class="auth-card">' +
+        '<div class="auth-tabs" role="tablist" aria-label="Authentication">' +
+          '<button type="button" class="auth-tab active" data-auth-tab="signin" role="tab" aria-selected="true">Sign In</button>' +
+          '<button type="button" class="auth-tab" data-auth-tab="signup" role="tab" aria-selected="false">Sign Up</button>' +
+        '</div>' +
+
+        '<form class="auth-panel" data-panel="signin" novalidate>' +
+          '<h3 class="auth-title">Welcome back</h3>' +
+          '<p class="auth-hint">Sign in to continue to your NotesAI workspace.</p>' +
+          '<div class="auth-field">' +
+            '<label class="auth-label" for="authSigninEmail">Email address</label>' +
+            '<div class="auth-input-wrap"><span class="auth-input-icon">' + ICON_MAIL + '</span>' +
+            '<input id="authSigninEmail" class="auth-input iconed" name="email" type="text" inputmode="email" autocomplete="username" placeholder="you@example.com" required></div>' +
+          '</div>' +
+          '<div class="auth-field">' +
+            '<label class="auth-label" for="authSigninPassword">Password</label>' +
+            '<div class="auth-input-wrap"><span class="auth-input-icon">' + ICON_LOCK + '</span>' +
+            '<input id="authSigninPassword" class="auth-input iconed" name="password" type="password" autocomplete="current-password" placeholder="••••••••" required></div>' +
+          '</div>' +
+          '<div class="auth-row"><button type="button" class="auth-link" data-forgot>Forgot Password?</button></div>' +
+          '<div class="auth-actions">' +
+            '<button type="button" class="auth-btn secondary" data-close>Cancel</button>' +
+            '<button type="submit" class="auth-btn">Sign In</button>' +
+          '</div>' +
+          '<p class="auth-msg" data-msg></p>' +
+        '</form>' +
+
+        '<form class="auth-panel" data-panel="signup" hidden novalidate>' +
+          '<h3 class="auth-title">Create your account</h3>' +
+          '<p class="auth-hint">Use 8+ characters with uppercase, lowercase and a number.</p>' +
+
+          '<div class="auth-field">' +
+            '<label class="auth-label" for="authSignupName">Full name</label>' +
+            '<div class="auth-input-wrap"><span class="auth-input-icon">' + ICON_USER + '</span>' +
+            '<input id="authSignupName" class="auth-input iconed" name="name" type="text" autocomplete="name" placeholder="Your name" required></div>' +
+            '<p class="auth-inline-error" data-name-error hidden></p>' +
+          '</div>' +
+
+          '<div class="auth-field">' +
+            '<label class="auth-label" for="authSignupEmail">Email address</label>' +
+            '<div class="auth-input-wrap"><span class="auth-input-icon">' + ICON_MAIL + '</span>' +
+            '<input id="authSignupEmail" class="auth-input iconed" name="email" type="text" inputmode="email" autocomplete="username" placeholder="you@example.com" required></div>' +
+            '<p class="auth-inline-error" data-email-error hidden></p>' +
+          '</div>' +
+
+          '<div class="auth-field">' +
+            '<label class="auth-label" for="authSignupPassword">Password</label>' +
+            '<div class="auth-input-wrap"><span class="auth-input-icon">' + ICON_LOCK + '</span>' +
+            '<input id="authSignupPassword" class="auth-input iconed" name="password" type="password" autocomplete="new-password" placeholder="••••••••" required></div>' +
+            '<div class="auth-rules">' +
+              '<div class="auth-rule unmet" data-rule="length"><span class="auth-rule-icon">❌</span><span>At least 8 characters</span></div>' +
+              '<div class="auth-rule unmet" data-rule="uppercase"><span class="auth-rule-icon">❌</span><span>Contains uppercase letter</span></div>' +
+              '<div class="auth-rule unmet" data-rule="lowercase"><span class="auth-rule-icon">❌</span><span>Contains lowercase letter</span></div>' +
+              '<div class="auth-rule unmet" data-rule="number"><span class="auth-rule-icon">❌</span><span>Contains a number</span></div>' +
+            '</div>' +
+            '<p class="auth-inline-error" data-password-error hidden></p>' +
+          '</div>' +
+
+          '<div class="auth-field">' +
+            '<label class="auth-label" for="authSignupConfirm">Confirm password</label>' +
+            '<div class="auth-input-wrap"><span class="auth-input-icon">' + ICON_LOCK + '</span>' +
+            '<input id="authSignupConfirm" class="auth-input iconed with-indicator" name="confirm_password" type="password" autocomplete="new-password" placeholder="••••••••" required>' +
+            '<span class="auth-indicator" data-confirm-indicator></span></div>' +
+            '<p class="auth-inline-error" data-confirm-error hidden>Passwords do not match.</p>' +
+          '</div>' +
+
+          '<button type="submit" class="auth-btn wide">Create Account</button>' +
+          '<div class="auth-actions"><button type="button" class="auth-btn secondary" data-close>Cancel</button></div>' +
+        '</form>' +
+      '</div>';
+
+    document.body.appendChild(modal);
+
+    modal.querySelectorAll('[data-close]').forEach(function (b) { b.addEventListener('click', close); });
+    modal.addEventListener('click', function (e) { if (e.target === modal) close(); });
+    modal.querySelectorAll('[data-auth-tab]').forEach(function (tab) {
+      tab.addEventListener('click', function () { activate(tab.getAttribute('data-auth-tab')); });
+    });
+    modal.querySelectorAll('[data-panel]').forEach(function (form) {
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        if (form.getAttribute('data-panel') === 'signup') submitSignUp(form);
+        else submitSignIn(form);
+      });
+    });
+
+    var signup = modal.querySelector('[data-panel="signup"]');
+    signup.querySelector('[name="name"]').addEventListener('input', function () { showFieldError(signup, 'name', ''); });
+    signup.querySelector('[name="email"]').addEventListener('input', function () { showFieldError(signup, 'email', ''); });
+    signup.querySelector('[name="password"]').addEventListener('input', function () {
+      updatePasswordRules(signup);
+      updateConfirmMatch(signup);
+      showFieldError(signup, 'password', '');
+    });
+    signup.querySelector('[name="confirm_password"]').addEventListener('input', function () { updateConfirmMatch(signup); });
+
+    modal.querySelector('[data-forgot]').addEventListener('click', forgotPassword);
+    activate('signin');
+  }
+
+  window.notesaiOpenAuth = open;
+  window.notesaiIsGuestAuth = isGuest;
+
+  if (isGuest()) {
+    document.documentElement.classList.add('notesai-guest');
+    var banner = document.createElement('div');
+    banner.className = 'guest-banner';
+    banner.setAttribute('role', 'status');
+    banner.innerHTML = '<span class="guest-banner-dot" aria-hidden="true"></span>' +
+      '<span>You are in <strong>Guest Mode</strong>. Sign in to save your work.</span>' +
+      '<button type="button" data-guest-auth>Sign In / Sign Up</button>';
+    var mainEl = document.querySelector('main');
+    if (mainEl && mainEl.firstChild) mainEl.insertBefore(banner, mainEl.firstChild);
+    else document.body.appendChild(banner);
+  }
+
+  window.notesaiClearAccessToken = clearToken;
 })();
 </script>
 </body>
@@ -14082,6 +16355,436 @@ def api_study_set_delete(set_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/study/export-pdf", methods=["POST"])
+@require_user_or_admin
+@security.rate_limit("api_pdf")
+def api_study_export_pdf():
+    """Export the current AI Study result as a clean printable PDF."""
+    payload = request.get_json(silent=True) or request.form
+    result = str(payload.get("result") or "").strip()
+    if len(result) < 3:
+        return _error_response("Generate study material before exporting a PDF.", 400,
+                               "STUDY_RESULT_REQUIRED", retryable=False)
+
+    action_label = _clean_pdf_text(payload.get("action_label") or "Study material")[:80] or "Study material"
+    source_name = _clean_pdf_text(payload.get("source_name") or "")[:120]
+    language = _clean_pdf_text(payload.get("language") or "English")[:60] or "English"
+    title = _clean_pdf_text(payload.get("title") or "NotesAI Study Pack")[:120] or "NotesAI Study Pack"
+    subtitle_parts = [action_label]
+    if source_name:
+        subtitle_parts.append(source_name)
+    subtitle_parts.append(language)
+    subtitle = " · ".join(subtitle_parts)
+
+    try:
+        pdf_bytes = generate_study_pdf(result, title=title, subtitle=subtitle, language=language)
+    except Exception as exc:
+        app.logger.warning("Study PDF export failed: %s", type(exc).__name__)
+        return _error_response("Could not create the study PDF. Please retry.", 500,
+                               "STUDY_PDF_FAILED", retryable=True)
+
+    add_activity("Study", "Exported %s as PDF" % action_label.lower(), "completed")
+    response = send_file(
+        io.BytesIO(pdf_bytes),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=_safe_study_pdf_name(title),
+    )
+    response.headers["X-NotesAI-Status"] = "study-pdf"
+    return response
+
+
+@app.route("/api/generate-planner", methods=["POST"])
+@require_user_or_admin
+@security.rate_limit("api_ai")
+def api_generate_planner():
+    """Generate, validate and persist one AI Exam Planner for the signed-in user."""
+    user_id = _planner_user_id()
+    if not user_id:
+        return _error_response("A signed-in account is required.", 403,
+                               "PLANNER_OWNER_REQUIRED", retryable=False)
+
+    payload = request.get_json(silent=True) or request.form
+    exam_name = _clean_planner_text(payload.get("exam_name") or payload.get("title"), 200)
+    if not exam_name:
+        return _error_response("Enter an exam name or subject.", 400,
+                               "EXAM_NAME_REQUIRED", retryable=False)
+
+    today = _parse_planner_today(payload)
+    if not today:
+        return _error_response("The provided current date is invalid.", 400,
+                               "INVALID_PLANNER_TODAY", retryable=False)
+    parsed_exam = _parse_planner_exam_date(payload.get("exam_date"), today)
+    if not parsed_exam:
+        return _error_response("Choose an exam date after today.", 400,
+                               "INVALID_EXAM_DATE", retryable=False)
+    exam_date, days_remaining = parsed_exam
+
+    raw_hours = payload.get("daily_hours")
+    if raw_hours in (None, ""):
+        raw_hours = payload.get("study_hours")
+    daily_hours = _parse_daily_hours(raw_hours)
+    if daily_hours is None:
+        return _error_response("Daily study hours must be between 0.5 and 16.", 400,
+                               "INVALID_DAILY_HOURS", retryable=False)
+
+    source, source_error = _resolve_planner_sources(payload, user_id)
+    if source_error:
+        return source_error
+
+    db = _planner_db()
+    existing = models.find_planner_by_exam(db, user_id, exam_name, exam_date.isoformat())
+    if existing and not _planner_flag(payload.get("confirm_new")):
+        return _error_response(
+            "A schedule for this exam already exists. Open it, or confirm to create a new version.",
+            409, "SCHEDULE_EXISTS", retryable=False,
+        )
+
+    dates = _planner_dates(today, days_remaining)
+    total_hours = round(daily_hours * days_remaining, 2)
+    prompt = build_exam_planner_prompt(
+        exam_name, exam_date.isoformat(), days_remaining, daily_hours,
+        total_hours, source["text"], dates,
+    )
+    text, provider, model, status, ai_error = generate_text_with_provider(
+        prompt, max_tokens=MAX_PLANNER_AI_MAX_TOKENS
+    )
+    if status != 200 or not text:
+        return _ai_failure_response(
+            status, ai_error or "The AI planner is unavailable right now.", provider, model
+        )
+
+    parsed_ai, parse_error = _parse_planner_ai_json(text)
+    if parsed_ai is None:
+        return _error_response(parse_error, 502, "INVALID_AI_SCHEDULE", retryable=True)
+    schedule, normalise_error = _normalise_planner_schedule(parsed_ai, dates, daily_hours)
+    if schedule is None:
+        return _error_response(normalise_error, 502, "INVALID_AI_SCHEDULE", retryable=True)
+
+    warnings = list(schedule.get("warnings") or [])
+    if source["truncated"]:
+        warnings.append("Source material was shortened before planning; check the original notes for full detail.")
+    schedule["warnings"] = warnings
+
+    planner = models.create_planner(
+        db, user_id,
+        exam_name=exam_name,
+        exam_date=exam_date.isoformat(),
+        today=today.isoformat(),
+        daily_hours=daily_hours,
+        days_remaining=days_remaining,
+        total_hours=total_hours,
+        source_summary=source["source_summary"],
+        warnings=warnings,
+        schedule=schedule,
+        progress=_planner_blank_progress(),
+        title=_clean_planner_text(payload.get("title"), 200) or exam_name,
+        provider=provider,
+        model=model,
+    )
+    add_activity("AI Study", "Generated exam planner: " + exam_name[:80], "completed",
+                 provider=provider, model=model)
+    return _planner_response({"ok": True, "planner": _public_planner(planner)})
+
+
+@app.route("/api/planners", methods=["GET"])
+@require_user_or_admin
+@security.rate_limit("api_general")
+def api_planners_list():
+    user_id = _planner_user_id()
+    if not user_id:
+        return _error_response("A signed-in account is required.", 403,
+                               "PLANNER_OWNER_REQUIRED", retryable=False)
+    items = models.list_planners(_planner_db(), user_id)
+    return _planner_response({
+        "ok": True,
+        "planners": [_public_planner(item, include_schedule=False) for item in items],
+    })
+
+
+@app.route("/api/planners/<planner_id>", methods=["GET"])
+@require_user_or_admin
+@security.rate_limit("api_general")
+def api_planner_get(planner_id):
+    item, error = _owned_planner_or_response(planner_id)
+    if error:
+        return error
+    return _planner_response({"ok": True, "planner": _public_planner(item)})
+
+
+@app.route("/api/planners/<planner_id>", methods=["PUT"])
+@require_user_or_admin
+@security.rate_limit("api_general")
+def api_planner_update(planner_id):
+    item, error = _owned_planner_or_response(planner_id)
+    if error:
+        return error
+    payload = request.get_json(silent=True) or request.form
+
+    today = _parse_planner_date(item.get("today")) or datetime.now().date()
+    exam_name = str(item.get("exam_name") or "")
+    exam_date = _parse_planner_date(item.get("exam_date")) or (today + timedelta(days=1))
+    days_remaining = int(item.get("days_remaining") or (exam_date - today).days)
+    daily_hours_raw = item.get("daily_hours")
+    daily_hours = _parse_daily_hours(daily_hours_raw) or 1.0
+    schedule_needs_sync = False
+
+    fields = {}
+    if "title" in payload:
+        title = _clean_planner_text(payload.get("title"), 200)
+        if title:
+            fields["title"] = title
+    if "exam_name" in payload:
+        new_name = _clean_planner_text(payload.get("exam_name"), 200)
+        if not new_name:
+            return _error_response("Enter an exam name or subject.", 400,
+                                   "EXAM_NAME_REQUIRED", retryable=False)
+        exam_name = new_name
+        fields["exam_name"] = new_name
+        schedule_needs_sync = True
+    if "exam_date" in payload:
+        parsed_exam = _parse_planner_exam_date(payload.get("exam_date"), today)
+        if not parsed_exam:
+            return _error_response("Choose an exam date after today.", 400,
+                                   "INVALID_EXAM_DATE", retryable=False)
+        exam_date, days_remaining = parsed_exam
+        fields["exam_date"] = exam_date.isoformat()
+        fields["days_remaining"] = days_remaining
+        schedule_needs_sync = True
+    if "daily_hours" in payload:
+        new_hours = _parse_daily_hours(payload.get("daily_hours"))
+        if new_hours is None:
+            return _error_response("Daily study hours must be between 0.5 and 16.", 400,
+                                   "INVALID_DAILY_HOURS", retryable=False)
+        daily_hours = new_hours
+        fields["daily_hours"] = new_hours
+        fields["total_hours"] = round(new_hours * days_remaining, 2)
+        schedule_needs_sync = True
+    if "status" in payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status not in {"active", "archived"}:
+            return _error_response("Invalid planner status.", 400,
+                                   "INVALID_PLANNER_STATUS", retryable=False)
+        fields["status"] = status
+    if "warnings" in payload:
+        fields["warnings_json"] = _planner_string_list(payload.get("warnings"), 20, 300)
+
+    if "schedule" in payload:
+        raw_schedule = payload.get("schedule")
+        if isinstance(raw_schedule, str):
+            try:
+                raw_schedule = json.loads(raw_schedule)
+            except (TypeError, ValueError):
+                return _error_response("The schedule must be valid JSON.", 400,
+                                       "INVALID_SCHEDULE", retryable=False)
+        if not isinstance(raw_schedule, dict):
+            return _error_response("The schedule must be a JSON object.", 400,
+                                   "INVALID_SCHEDULE", retryable=False)
+        schedule, normalise_error = _normalise_planner_schedule(
+            raw_schedule, _planner_dates(today, days_remaining), daily_hours
+        )
+        if schedule is None:
+            return _error_response(normalise_error, 400, "INVALID_SCHEDULE", retryable=False)
+        fields["schedule_json"] = schedule
+    elif schedule_needs_sync:
+        return _error_response(
+            "Send the updated schedule when changing exam details.", 400,
+            "SCHEDULE_REQUIRED", retryable=False,
+        )
+
+    if "schedule_json" in fields:
+        valid_ids = {
+            str(topic.get("id") or "")
+            for day in fields["schedule_json"].get("days") or []
+            for topic in day.get("topics") or [] if isinstance(topic, dict)
+        }
+        progress = item.get("progress") or _planner_blank_progress()
+        completed = progress.get("completed") if isinstance(progress.get("completed"), dict) else {}
+        progress["completed"] = {key: value for key, value in completed.items() if key in valid_ids}
+        fields["progress_json"] = progress
+
+    updated = models.update_planner(_planner_db(), item["id"], _planner_user_id(), fields)
+    if not updated:
+        return _error_response("Could not update this planner.", 500,
+                               "PLANNER_SAVE_FAILED", retryable=True)
+    return _planner_response({"ok": True, "planner": _public_planner(updated)})
+
+
+@app.route("/api/planners/<planner_id>", methods=["DELETE"])
+@require_user_or_admin
+@security.rate_limit("api_general")
+def api_planner_delete(planner_id):
+    item, error = _owned_planner_or_response(planner_id)
+    if error:
+        return error
+    if not models.delete_planner(_planner_db(), item["id"], _planner_user_id()):
+        return _error_response("Could not delete this planner.", 500,
+                               "PLANNER_DELETE_FAILED", retryable=True)
+    add_activity("AI Study", "Deleted exam planner: " + str(item.get("exam_name") or "")[:80], "completed")
+    return _planner_response({"ok": True})
+
+
+@app.route("/api/planners/<planner_id>/progress", methods=["POST"])
+@require_user_or_admin
+@security.rate_limit("api_general")
+def api_planner_progress(planner_id):
+    item, error = _owned_planner_or_response(planner_id)
+    if error:
+        return error
+    payload = request.get_json(silent=True) or request.form
+    schedule = item.get("schedule") or {}
+    progress = item.get("progress") or _planner_blank_progress()
+    completed = progress.get("completed") if isinstance(progress.get("completed"), dict) else {}
+    missed = progress.get("missed_days") if isinstance(progress.get("missed_days"), list) else []
+    valid_ids = {
+        str(topic.get("id") or "")
+        for day in schedule.get("days") or []
+        for topic in day.get("topics") or [] if isinstance(topic, dict)
+    }
+
+    if "topic_id" in payload:
+        topic_id = str(payload.get("topic_id") or "").strip()
+        if topic_id not in valid_ids:
+            return _error_response("That topic does not belong to this planner.", 400,
+                                   "INVALID_PLANNER_TOPIC", retryable=False)
+        if _planner_flag(payload.get("completed")):
+            completed[topic_id] = True
+        else:
+            completed.pop(topic_id, None)
+    elif "day_number" in payload and "topic_index" in payload:
+        try:
+            day_number = int(payload.get("day_number"))
+            topic_index = int(payload.get("topic_index"))
+        except (TypeError, ValueError):
+            return _error_response("Invalid topic position.", 400,
+                                   "INVALID_PLANNER_TOPIC", retryable=False)
+        day = next((entry for entry in schedule.get("days") or []
+                    if int(entry.get("day_number") or 0) == day_number), None)
+        topics = (day or {}).get("topics") or []
+        if topic_index < 0 or topic_index >= len(topics):
+            return _error_response("That topic does not belong to this planner.", 400,
+                                   "INVALID_PLANNER_TOPIC", retryable=False)
+        topic_id = str(topics[topic_index].get("id") or "")
+        if _planner_flag(payload.get("completed")):
+            completed[topic_id] = True
+        else:
+            completed.pop(topic_id, None)
+    elif not any(key in payload for key in ("miss_day", "missed_day")):
+        return _error_response("Send a topic id or a missed-day update.", 400,
+                               "PLANNER_PROGRESS_REQUIRED", retryable=False)
+
+    fields = {}
+    miss_value = payload.get("miss_day")
+    if miss_value is None:
+        miss_value = payload.get("missed_day")
+    if miss_value is not None:
+        try:
+            day_number = int(miss_value)
+        except (TypeError, ValueError):
+            return _error_response("Invalid day number.", 400,
+                                   "INVALID_PLANNER_DAY", retryable=False)
+        valid_days = {int(day.get("day_number") or 0) for day in schedule.get("days") or []}
+        if day_number not in valid_days:
+            return _error_response("That day does not belong to this planner.", 400,
+                                   "INVALID_PLANNER_DAY", retryable=False)
+        if _planner_flag(payload.get("missed")):
+            if day_number not in missed:
+                missed.append(day_number)
+        elif day_number in missed:
+            missed.remove(day_number)
+        for day in schedule.get("days") or []:
+            day["missed"] = int(day.get("day_number") or 0) in missed
+        fields["schedule_json"] = schedule
+
+    progress["completed"] = completed
+    progress["missed_days"] = missed
+    fields["progress_json"] = progress
+    updated = models.update_planner(_planner_db(), item["id"], _planner_user_id(), fields)
+    if not updated:
+        return _error_response("Could not save progress.", 500,
+                               "PLANNER_PROGRESS_FAILED", retryable=True)
+    public = _public_planner(updated)
+    return _planner_response({
+        "ok": True,
+        "planner": public,
+        "progress_summary": public["progress_summary"],
+    })
+
+
+@app.route("/api/planners/<planner_id>/reschedule", methods=["POST"])
+@require_user_or_admin
+@security.rate_limit("api_general")
+def api_planner_reschedule(planner_id):
+    item, error = _owned_planner_or_response(planner_id)
+    if error:
+        return error
+    payload = request.get_json(silent=True) or request.form
+    today = _parse_planner_today(payload) or _parse_planner_date(item.get("today")) or datetime.now().date()
+    exam_date = _parse_planner_date(item.get("exam_date"))
+    if not exam_date:
+        return _error_response("This planner has an invalid exam date.", 500,
+                               "PLANNER_DATA_INVALID", retryable=False)
+    remaining = (exam_date - today).days
+    if remaining < 1:
+        return _error_response("The exam date has passed. Create a new planner.", 400,
+                               "EXAM_DATE_PASSED", retryable=False)
+
+    preview = _build_reschedule_preview(
+        item.get("schedule") or {}, item.get("progress") or _planner_blank_progress(),
+        today, remaining, float(item.get("daily_hours") or 1.0),
+    )
+    if not _planner_flag(payload.get("apply")):
+        return _planner_response({"ok": True, "applied": False, "preview": preview})
+    if not preview["can_apply"]:
+        return _error_response(
+            "The remaining time is not enough. Review the preview and shorten topics or increase daily hours.",
+            400, "CAPACITY_INSUFFICIENT", retryable=False,
+        )
+
+    fields = {
+        "schedule_json": preview["schedule"],
+        "progress_json": preview["progress"],
+        "previous_schedule_json": item.get("schedule") or {},
+    }
+    updated = models.update_planner(
+        _planner_db(), item["id"], _planner_user_id(), fields, bump_version=True
+    )
+    if not updated:
+        return _error_response("Could not apply the rescheduled plan.", 500,
+                               "PLANNER_RESCHEDULE_FAILED", retryable=True)
+    add_activity("AI Study", "Rescheduled exam planner: " + str(item.get("exam_name") or "")[:80], "completed")
+    return _planner_response({"ok": True, "applied": True, "planner": _public_planner(updated)})
+
+
+@app.route("/api/planners/<planner_id>/pdf", methods=["POST"])
+@require_user_or_admin
+@security.rate_limit("api_pdf")
+def api_planner_pdf(planner_id):
+    item, error = _owned_planner_or_response(planner_id)
+    if error:
+        return error
+    payload = request.get_json(silent=True) or request.form
+    language = _clean_planner_text(payload.get("language") or "English", 60) or "English"
+    try:
+        pdf_bytes = generate_planner_pdf(item, language=language)
+    except Exception as exc:
+        app.logger.warning("Planner PDF export failed: %s", type(exc).__name__)
+        return _error_response("Could not create the planner PDF. Please retry.", 500,
+                               "PLANNER_PDF_FAILED", retryable=True)
+    add_activity("AI Study", "Exported exam planner as PDF", "completed")
+    response = send_file(
+        io.BytesIO(pdf_bytes),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=_safe_study_pdf_name(
+            str(item.get("exam_name") or "Exam Planner") + " - Study Schedule.pdf"
+        ),
+    )
+    response.headers["X-NotesAI-Status"] = "planner-pdf"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/api/admin/overview")
 def api_admin_overview():
     # Rate limiting
@@ -14201,7 +16904,7 @@ def api_admin_backup():
 @security.rate_limit("api_ai")
 def api_diagram_preview():
     payload = request.get_json(silent=True) or {}
-    style = normalise_diagram_style(payload.get("style") or request.form.get("diagramStyle", "color"))
+    style = normalise_diagram_style(payload.get("style") or request.form.get("diagramStyle", "universal"))
 
     def preview_one(raw):
         diagram = normalise_diagram(raw)
@@ -14288,7 +16991,7 @@ def api_diagram_reconstruct():
     diagram = normalise_diagram(raw_diagram, page_index)
     if not diagram or not diagram.get("labels"):
         return jsonify(error="This diagram has no labels to reconstruct."), 400
-    style = normalise_diagram_style(request.form.get("diagramStyle", "color"))
+    style = normalise_diagram_style(request.form.get("diagramStyle", "universal"))
 
     # Try a source-accurate vector trace first for line-art diagrams.
     # This preserves anatomy and labels exactly instead of asking the model
@@ -14684,7 +17387,7 @@ def extract_text():
 
     analysis_mode = (request.form.get("analysis") or "").strip().lower() == "smart" or (request.form.get("mode") or "").strip().lower() == "smart"
     if analysis_mode:
-        diagram_style = normalise_diagram_style(request.form.get("diagramStyle", "color"))
+        diagram_style = normalise_diagram_style(request.form.get("diagramStyle", "universal"))
         analysis, model_used, status, error, previews = analyze_smart_pages(files, provider, diagram_style=diagram_style)
         app.logger.info(
             "Smart extraction provider=%s model=%s files=%d status=%s",
@@ -14847,7 +17550,7 @@ def generate_pdf():
         "margin": margin,
         "fontSize": font_size,
         "style": style,
-        "diagramStyle": normalise_diagram_style(request.form.get("diagramStyle", "color")),
+        "diagramStyle": normalise_diagram_style(request.form.get("diagramStyle", "universal")),
     }
     options.update(normalise_pdf_options(request.form))
     options["folder"] = str(request.form.get("folder") or "").strip()[:80]
@@ -14930,7 +17633,7 @@ def generate_pdf():
                 missing = "GEMINI_API_KEY" if active_provider == "gemini" else "OPENROUTER_API_KEY"
                 return _error_response(f"No AI provider configured for smart PDF. Add {missing} in server .env.", 503, "PROVIDER_NOT_CONFIGURED", retryable=False)
             analysis, model_used, status, error, _previews = analyze_smart_pages(
-                files, provider, diagram_style=options.get("diagramStyle", "color")
+                files, provider, diagram_style=options.get("diagramStyle", "universal")
             )
             provider_used = provider
             if status:
@@ -15213,7 +17916,7 @@ def api_auth_login():
         return _error_response(error, 401, "LOGIN_FAILED", retryable=False)
 
     security.audit_log("login_success", {"email": email, "user_id": user["id"]})
-    return jsonify({
+    response = jsonify({
         "ok": True,
         "user": {
             "id": user["id"],
@@ -15226,6 +17929,9 @@ def api_auth_login():
         "token_type": "Bearer",
         "expires_in": 900,
     })
+    if user.get("role") == "admin":
+        response = set_admin_session_cookies(response, user["id"])
+    return response
 
 
 @app.route("/api/auth/refresh", methods=["POST"])
@@ -15268,6 +17974,23 @@ def api_auth_me():
             "created_at": user["created_at"],
         },
     })
+
+
+@app.route("/api/admin/session", methods=["GET"])
+@require_admin_auth
+def api_admin_session():
+    session = getattr(g, "admin_session", None)
+    return jsonify({
+        "ok": True,
+        "csrf": session["csrf"] if session else "",
+        "expires_in": 1800,
+    })
+
+
+@app.route("/api/admin/logout", methods=["POST"])
+@require_admin_auth
+def api_admin_logout():
+    return clear_admin_session_cookies(jsonify({"ok": True}))
 
 
 @app.route("/api/auth/logout", methods=["POST"])
@@ -15395,7 +18118,7 @@ def home():
     user = get_current_user()
     user_name = user.get('name', 'User') if user else 'Guest'
     user_initial = user_name[0].upper() if user_name else 'G'
-    return _PAGE_TEMPLATE.render( page='dashboard', page_title='Dashboard', page_desc='', stats=stats, activity=activity, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'), user_name=user_name, user_initial=user_initial)
+    return _PAGE_TEMPLATE.render( page='dashboard', page_title='Dashboard', page_desc='', stats=stats, activity=activity, user_name=user_name, user_initial=user_initial)
 
 @app.route("/health")
 def health():
@@ -15424,7 +18147,7 @@ def navigation_page(page):
     user = get_current_user()
     user_name = user.get('name', 'User') if user else 'Guest'
     user_initial = user_name[0].upper() if user_name else 'G'
-    return _PAGE_TEMPLATE.render( page=page, page_title=title, page_desc=description, admin_token=os.getenv('NOTESAI_ADMIN_TOKEN','') or get_env_key('NOTESAI_ADMIN_TOKEN'), user_name=user_name, user_initial=user_initial, support_email=os.getenv('NOTESAI_SUPPORT_EMAIL','support@notesai.app'))
+    return _PAGE_TEMPLATE.render( page=page, page_title=title, page_desc=description, user_name=user_name, user_initial=user_initial, support_email=os.getenv('NOTESAI_SUPPORT_EMAIL','support@notesai.app'))
 
 if __name__ == "__main__":
     try:

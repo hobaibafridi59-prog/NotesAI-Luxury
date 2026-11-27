@@ -418,6 +418,153 @@ def delete_study_set(db, set_id, user_id):
 
 
 # ============================================================================
+# AI EXAM PLANNER MODEL
+# ============================================================================
+
+_PLANNER_JSON_COLUMNS = {"warnings_json", "schedule_json", "progress_json", "previous_schedule_json"}
+_PLANNER_UPDATABLE = {
+    "title", "exam_name", "exam_date", "today", "daily_hours", "days_remaining",
+    "total_hours", "source_summary", "warnings_json", "schedule_json",
+    "progress_json", "previous_schedule_json", "status", "version", "provider", "model",
+}
+
+
+def _decode_planner_json(value, fallback):
+    """Decode a planner JSON column without ever raising on old/corrupt rows."""
+    if value in (None, ""):
+        return fallback
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return fallback
+    if isinstance(fallback, dict) and not isinstance(parsed, dict):
+        return fallback
+    if isinstance(fallback, list) and not isinstance(parsed, list):
+        return fallback
+    return parsed
+
+
+def _planner_from_row(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["warnings"] = _decode_planner_json(item.get("warnings_json"), [])
+    item["schedule"] = _decode_planner_json(item.get("schedule_json"), {})
+    item["progress"] = _decode_planner_json(
+        item.get("progress_json"), {"completed": {}, "missed_days": []}
+    )
+    item["previous_schedule"] = (
+        _decode_planner_json(item.get("previous_schedule_json"), {})
+        if item.get("previous_schedule_json") else None
+    )
+    return item
+
+
+def create_planner(db, user_id, *, exam_name, exam_date, today, daily_hours,
+                   days_remaining, total_hours, source_summary="", warnings=None,
+                   schedule=None, progress=None, title="", provider="", model=""):
+    """Create a planner owned by one user. Returns the full planner record."""
+    planner_id = uuid.uuid4().hex
+    now = now_iso()
+    db.execute(
+        """INSERT INTO exam_planners (
+              id, user_id, title, exam_name, exam_date, today, daily_hours,
+              days_remaining, total_hours, source_summary, warnings_json,
+              schedule_json, progress_json, status, version, provider, model,
+              created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?)""",
+        (
+            planner_id, user_id, str(title or "")[:200], str(exam_name or "")[:200],
+            str(exam_date), str(today), float(daily_hours), int(days_remaining),
+            float(total_hours), str(source_summary or "")[:1000],
+            json.dumps(warnings or [], ensure_ascii=False),
+            json.dumps(schedule or {}, ensure_ascii=False),
+            json.dumps(progress or {"completed": {}, "missed_days": []}, ensure_ascii=False),
+            str(provider or "")[:80], str(model or "")[:120], now, now,
+        )
+    )
+    db.commit()
+    return get_planner(db, planner_id, user_id)
+
+
+def get_planner(db, planner_id, user_id):
+    """Get a planner only when it belongs to user_id."""
+    row = db.execute(
+        "SELECT * FROM exam_planners WHERE id = ? AND user_id = ?",
+        (str(planner_id), str(user_id)),
+    ).fetchone()
+    return _planner_from_row(row)
+
+
+def list_planners(db, user_id, limit=100):
+    """List the user's planners, newest first."""
+    rows = db.execute(
+        "SELECT * FROM exam_planners WHERE user_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT ?",
+        (str(user_id), int(limit)),
+    ).fetchall()
+    return [_planner_from_row(row) for row in rows]
+
+
+def find_planner_by_exam(db, user_id, exam_name, exam_date):
+    """Find an existing planner for the same exam name/date."""
+    row = db.execute(
+        """SELECT * FROM exam_planners
+           WHERE user_id = ? AND LOWER(exam_name) = LOWER(?) AND exam_date = ?
+           ORDER BY created_at DESC LIMIT 1""",
+        (str(user_id), str(exam_name), str(exam_date)),
+    ).fetchone()
+    return _planner_from_row(row)
+
+
+def update_planner(db, planner_id, user_id, fields, bump_version=False):
+    """Update owned planner fields. Unknown keys are ignored for safety."""
+    changes = []
+    values = []
+    for key, value in (fields or {}).items():
+        if key not in _PLANNER_UPDATABLE:
+            continue
+        if key in _PLANNER_JSON_COLUMNS and not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        changes.append(f"{key} = ?")
+        values.append(value)
+    if bump_version:
+        changes.append("version = version + 1")
+    if not changes:
+        return get_planner(db, planner_id, user_id)
+    changes.append("updated_at = ?")
+    values.append(now_iso())
+    values.extend([str(planner_id), str(user_id)])
+    cursor = db.execute(
+        "UPDATE exam_planners SET " + ", ".join(changes) + " WHERE id = ? AND user_id = ?",
+        values,
+    )
+    db.commit()
+    if cursor.rowcount <= 0:
+        return None
+    return get_planner(db, planner_id, user_id)
+
+
+def delete_planner(db, planner_id, user_id):
+    """Delete a planner only when it belongs to user_id."""
+    cursor = db.execute(
+        "DELETE FROM exam_planners WHERE id = ? AND user_id = ?",
+        (str(planner_id), str(user_id)),
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+
+def save_planner_progress(db, planner_id, user_id, progress):
+    """Persist real completion data for the user's planner."""
+    return update_planner(
+        db, planner_id, user_id,
+        {"progress_json": progress or {"completed": {}, "missed_days": []}},
+    )
+
+
+# ============================================================================
 # SUBSCRIPTION & BILLING MODEL
 # ============================================================================
 

@@ -64,7 +64,14 @@ See `.env.example` for all configuration options. Required:
 
 Optional:
 - `OPENROUTER_API_KEY` — OpenRouter API key
-- `NOTESAI_ADMIN_TOKEN` — Admin access token for remote management
+- `NOTESAI_ADMIN_TOKEN` — Legacy admin token (unused by browser; opt-in header fallback only)
+- `NOTESAI_ALLOW_ADMIN_TOKEN_HEADER` — Set `1` only for temporary server-to-server migration
+- `NOTESAI_ALLOW_LOCALHOST_ADMIN` — Set `1` only for local development; disabled by default
+- `NOTESAI_ALLOW_LOCALHOST_USER` — Set `1` only for local development; allows anonymous loopback user APIs; disabled by default
+- Guest mode is the default: pages are browsable, but data/action APIs return `401` until sign in. Leave both localhost bypass flags unset to test the walled garden.
+- `NOTESAI_TRUST_PROXY_COUNT` — Number of trusted reverse proxies (enables ProxyFix)
+- `NOTESAI_COOKIE_SECURE` — Set `1` to force Secure cookies when TLS terminates upstream
+- `NOTESAI_CORS_ORIGINS` — Comma-separated extra allowed browser origins
 - `NOTESAI_JWT_SECRET` — JWT signing secret (recommended for production)
 - `NOTESAI_HOST` — Server host (default: 127.0.0.1)
 - `NOTESAI_PORT` — Server port (default: 3000)

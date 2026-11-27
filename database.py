@@ -265,6 +265,35 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id)
 CREATE INDEX IF NOT EXISTS idx_password_reset_user_id ON password_reset_tokens(user_id);
 
 -- ============================================================================
+-- AI EXAM PLANNER
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS exam_planners (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    exam_name TEXT NOT NULL,
+    exam_date TEXT NOT NULL,
+    today TEXT NOT NULL,
+    daily_hours REAL NOT NULL,
+    days_remaining INTEGER NOT NULL,
+    total_hours REAL NOT NULL,
+    source_summary TEXT NOT NULL DEFAULT '',
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    schedule_json TEXT NOT NULL,
+    progress_json TEXT NOT NULL DEFAULT '{"completed": {}, "missed_days": []}',
+    previous_schedule_json TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    version INTEGER NOT NULL DEFAULT 1,
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_exam_planners_user_id ON exam_planners(user_id);
+CREATE INDEX IF NOT EXISTS idx_exam_planners_user_exam ON exam_planners(user_id, exam_date);
+
+-- ============================================================================
 -- SCHEMA VERSION
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -273,6 +302,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES ('1.0.0', datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES ('1.1.0', datetime('now'));
 
 -- ============================================================================
 -- DEFAULT DATA
