@@ -15436,9 +15436,9 @@ if __name__ == "__main__":
     # LAN access:   NOTESAI_HOST=0.0.0.0 NOTESAI_ADMIN_TOKEN=<secret> python app.py
     runtime_host = os.getenv("NOTESAI_HOST", "127.0.0.1").strip() or "127.0.0.1"
     try:
-        runtime_port = int(os.getenv("NOTESAI_PORT", "3000"))
+        runtime_port = int(os.getenv("NOTESAI_PORT", "3001"))
     except (TypeError, ValueError):
-        runtime_port = 3000
+        runtime_port = 3001
     runtime_debug = _env_bool("NOTESAI_DEBUG", False)
     # load_dotenv=False: the app reads only PROJECT_ROOT/.env, so an unrelated
     # ~/.env from another project can never supply/override NotesAI keys.
