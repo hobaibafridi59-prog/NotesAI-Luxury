@@ -136,9 +136,26 @@ def _admin_cookie_secure():
 
 
 def create_admin_session(user_id):
-    """Return (signed_cookie_value, csrf_token) for an admin user."""
+    """Create a server-backed admin session.
+
+    Returns (signed_cookie_value, csrf_token). The signed cookie carries a
+    random session id (jti) that is also stored in the database so logout can
+    revoke it server-side, not just clear the browser cookie.
+    """
+    jti = uuid.uuid4().hex
     csrf = secrets.token_urlsafe(24)
-    token = _admin_session_signer.dumps({"uid": str(user_id), "csrf": csrf})
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=ADMIN_SESSION_MAX_AGE)
+    token = _admin_session_signer.dumps(
+        {"uid": str(user_id), "jti": jti, "csrf": csrf}
+    )
+    db = database.get_db()
+    db.execute(
+        "INSERT INTO admin_sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (jti, str(user_id), now.isoformat(), expires_at.isoformat()),
+    )
+    db.execute("DELETE FROM admin_sessions WHERE expires_at < ?", (now.isoformat(),))
+    db.commit()
     return token, csrf
 
 
@@ -154,8 +171,9 @@ def decode_admin_session(token=""):
     if not isinstance(data, dict):
         return None
     uid = str(data.get("uid") or "")
+    jti = str(data.get("jti") or "")
     csrf = str(data.get("csrf") or "")
-    return {"uid": uid, "csrf": csrf} if uid and csrf else None
+    return {"uid": uid, "jti": jti, "csrf": csrf} if uid and jti and csrf else None
 
 
 def resolve_admin_session():
@@ -165,12 +183,45 @@ def resolve_admin_session():
         return None
     try:
         db = database.get_db()
+        row = db.execute(
+            "SELECT id, user_id, expires_at, revoked_at FROM admin_sessions WHERE id = ?",
+            (data["jti"],),
+        ).fetchone()
+        if not row or row["revoked_at"] or row["user_id"] != data["uid"]:
+            return None
+        expires_at = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > expires_at:
+            return None
         user = models.get_user_by_id(db, data["uid"])
     except Exception:
         return None
     if not user or user.get("role") != "admin" or user.get("status") != "active":
         return None
-    return {"user_id": data["uid"], "user": user, "csrf": data["csrf"]}
+    return {
+        "user_id": data["uid"],
+        "user": user,
+        "csrf": data["csrf"],
+        "jti": data["jti"],
+    }
+
+
+def revoke_current_admin_session():
+    """Mark the current signed admin session as revoked in the database."""
+    data = decode_admin_session(request.cookies.get(ADMIN_SESSION_COOKIE, ""))
+    if not data:
+        return False
+    try:
+        db = database.get_db()
+        db.execute(
+            "UPDATE admin_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            (datetime.now(timezone.utc).isoformat(), data["jti"]),
+        )
+        db.commit()
+        return True
+    except Exception:
+        return False
 
 
 def csrf_token_valid(session_data):
@@ -195,6 +246,7 @@ def set_admin_session_cookies(response, user_id):
 
 
 def clear_admin_session_cookies(response):
+    revoke_current_admin_session()
     secure = _admin_cookie_secure()
     response.delete_cookie(ADMIN_SESSION_COOKIE, path="/", samesite="Strict", secure=secure)
     response.delete_cookie(ADMIN_CSRF_COOKIE, path="/", samesite="Strict", secure=secure)
@@ -345,7 +397,7 @@ def require_auth(f):
     def decorated(*args, **kwargs):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
-            return jsonify({"error": "Authentication required", "code": "AUTH_REQUIRED"}), 401
+            return jsonify({"ok": False, "error": "Authentication required", "code": "AUTH_REQUIRED"}), 401
 
         token = auth_header[7:].strip()
         try:
@@ -386,7 +438,7 @@ def require_admin(f):
         session = resolve_admin_session()
         if session:
             if not csrf_token_valid(session):
-                return jsonify({"error": "CSRF token missing or invalid", "code": "CSRF_INVALID"}), 403
+                return jsonify({"ok": False, "error": "CSRF token missing or invalid", "code": "CSRF_INVALID"}), 403
             g.user_id = session["user_id"]
             g.user = session["user"]
             g.user_role = "admin"
@@ -426,7 +478,7 @@ def require_admin(f):
             except ValueError:
                 pass
 
-        return jsonify({"error": "Admin access required", "code": "ADMIN_REQUIRED"}), 403
+        return jsonify({"ok": False, "error": "Admin access required", "code": "ADMIN_REQUIRED"}), 403
     return decorated
 
 
@@ -441,7 +493,7 @@ def require_user_or_admin(f):
         session = resolve_admin_session()
         if session:
             if not csrf_token_valid(session):
-                return jsonify({"error": "CSRF token missing or invalid", "code": "CSRF_INVALID"}), 403
+                return jsonify({"ok": False, "error": "CSRF token missing or invalid", "code": "CSRF_INVALID"}), 403
             g.user_id = session["user_id"]
             g.user = session["user"]
             g.user_role = "admin"
@@ -487,7 +539,7 @@ def require_user_or_admin(f):
             g.user_role = "user"
             return f(*args, **kwargs)
 
-        return jsonify({"error": "Authentication required", "code": "AUTH_REQUIRED"}), 401
+        return jsonify({"ok": False, "error": "Authentication required", "code": "AUTH_REQUIRED"}), 401
     return decorated
 
 

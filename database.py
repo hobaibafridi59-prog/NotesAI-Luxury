@@ -117,6 +117,17 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 
 -- ============================================================================
+-- ADMIN SESSIONS (server-side revocation for signed admin cookies)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+-- ============================================================================
 -- DOCUMENTS
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS documents (

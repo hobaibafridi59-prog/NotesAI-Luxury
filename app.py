@@ -1768,13 +1768,16 @@ def require_admin():
             pass
 
     if not os.getenv(ADMIN_TOKEN_ENV, "").strip():
-        app.logger.warning("admin_auth_denied path=%s code=ADMIN_TOKEN_MISSING", request.path)
+        app.logger.warning("admin_auth_denied path=%s code=ADMIN_AUTH_REQUIRED", request.path)
         return _admin_error(
-            "Admin session or JWT required. No legacy admin token is configured.",
-            "ADMIN_TOKEN_MISSING",
+            "Admin access required. Sign in with an administrator account.",
+            "ADMIN_AUTH_REQUIRED",
         )
     app.logger.warning("admin_auth_denied path=%s code=ADMIN_AUTH_REQUIRED", request.path)
-    return _admin_error("Unauthorized. Provide a valid admin session or JWT.", "ADMIN_AUTH_REQUIRED")
+    return _admin_error(
+        "Admin access required. Sign in with an administrator account.",
+        "ADMIN_AUTH_REQUIRED",
+    )
 
 
 def validate_openrouter_base_url(base_url):
@@ -12510,11 +12513,26 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       setButtonLoading(testProviderBtn, true);
       if (providerTestStatus) providerTestStatus.textContent = 'Testing ' + provider + '…';
       try {
-        const res = await fetch('/api/provider/test', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ provider }) });
-        const data = await res.json();
-        if (data.ok) {
+        const res = await fetchWithTimeout('/api/provider/test', {
+          method: 'POST',
+          headers: adminHeaders(),
+          body: JSON.stringify({ provider }),
+          credentials: 'same-origin'
+        }, 90000);
+        const data = await res.json().catch(function () { return {}; });
+        const code = String(data.code || '');
+        if (res.ok && data.ok) {
           if (providerTestStatus) providerTestStatus.textContent = 'Connected. Model: ' + (data.model || 'default');
           showToast(data.message || 'Connection successful.', 'success');
+        } else if (res.status === 401 || code === 'ADMIN_AUTH_REQUIRED' || code === 'ADMIN_REQUIRED' || code === 'ADMIN_TOKEN_MISSING') {
+          try { sessionStorage.removeItem('notesaiAccessToken'); } catch (_) {}
+          if (providerTestStatus) providerTestStatus.textContent = 'Admin sign-in required.';
+          showToast('Admin sign-in required. Please sign in again.', 'error');
+          if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
+        } else if (code === 'CSRF_INVALID') {
+          if (providerTestStatus) providerTestStatus.textContent = 'Security token expired.';
+          showToast('Security token expired. Please sign in again.', 'error');
+          if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
         } else {
           if (providerTestStatus) providerTestStatus.textContent = data.error || 'Connection failed.';
           showToast(data.error || 'Connection failed.', 'error');
@@ -14165,8 +14183,12 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
   const adminPanel = document.getElementById('adminPanel');
   if (adminPanel) {
     fetch('/api/admin/session', { credentials: 'same-origin' }).then(function (r) {
-      if (!r.ok && window.notesaiShowToast) {
-        window.notesaiShowToast('Admin sign-in required to manage this workspace.', 'error');
+      if (!r.ok) {
+        try { sessionStorage.removeItem('notesaiAccessToken'); } catch (_) {}
+        if (window.notesaiShowToast) {
+          window.notesaiShowToast('Admin sign-in required. Sign in with an administrator account.', 'error');
+        }
+        if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
       }
     }).catch(function () {});
     const reloadBtn = document.getElementById('adminReloadBtn');
@@ -14185,6 +14207,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
     const renderAdmin = (data) => {
       overview = data;
       const docs = data.documents || {};
+      const stats = data.stats || {};
       const failed = data.failed_jobs || [];
       setText('adminDocs', docs.total || 0);
       setText('adminStorage', formatBytes(docs.storage_bytes || 0));
@@ -14203,6 +14226,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
           .join(' · ') || '—';
         system.innerHTML = `
           <div class="admin-row"><span>Health</span><span>${escapeHtml((data.health && data.health.status) || 'unknown')}</span></div>
+          <div class="admin-row"><span>Workspace stats</span><span>${escapeHtml(stats.total_documents || 0)} total / ${escapeHtml(stats.completed || 0)} completed / ${escapeHtml(stats.failed || 0)} failed</span></div>
           <div class="admin-row"><span>Active provider</span><span>${escapeHtml(active)}</span></div>
           <div class="admin-row"><span>Provider status</span><span>${escapeHtml(providerEntry.status || 'not tested')}</span></div>
           <div class="admin-row"><span>Documents / trash</span><span>${escapeHtml(docs.total || 0)} / ${escapeHtml(docs.trash || 0)}</span></div>
@@ -14268,7 +14292,9 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
         renderAdmin(data);
       } catch (error) {
         if (error.status === 401 || error.status === 403) {
-                toast('Admin token required for this remote session.', 'warning', 6500);
+          try { sessionStorage.removeItem('notesaiAccessToken'); } catch (_) {}
+          toast('Admin sign-in required to load this workspace.', 'warning', 6500);
+          if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
         } else {
           toast(error.message || 'Could not load the admin overview.', 'error', 7000);
         }
@@ -14337,7 +14363,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       backupBtn.addEventListener('click', async () => {
         backupBtn.disabled = true;
         try {
-          const response = await fetch('/api/admin/backup', { headers: adminHeaders() });
+          const response = await fetch('/api/admin/backup', { headers: adminHeaders(), credentials: 'same-origin' });
           if (!response.ok) {
             const data = await response.json().catch(() => ({}));
             throw new Error(data.error || 'Could not create the backup.');

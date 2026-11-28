@@ -76,6 +76,24 @@ Optional:
 - `NOTESAI_HOST` — Server host (default: 127.0.0.1)
 - `NOTESAI_PORT` — Server port (default: 3000)
 
+### Admin bootstrap (one-time, server-side only)
+
+New registrations are always normal users. To promote the existing owner
+account to admin, run this in the PythonAnywhere console — never from a public
+HTTP route:
+
+```bash
+cd /home/hobaibafridi59/notesai-deploy
+source /home/hobaibafridi59/.virtualenvs/notesai-venv/bin/activate
+python promote_owner.py
+```
+
+The script asks for the registered email, verifies the row exists, requires
+`PROMOTE` confirmation, and updates only `role`/`status`. It does not create a
+duplicate account, print passwords/tokens, or touch existing documents and
+study data. Sign out and sign in again after promotion so fresh admin cookies
+are issued.
+
 ### Email validation and verification
 
 Signups reject disposable/temporary email domains and, when `dnspython` is installed, check that the domain has an MX record. Set `NOTESAI_EMAIL_MX_CHECK=0` to skip DNS checks.
