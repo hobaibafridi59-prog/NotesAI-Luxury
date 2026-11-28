@@ -1730,6 +1730,7 @@ def require_admin():
     session = resolve_admin_session()
     if session:
         if not csrf_token_valid(session):
+            app.logger.warning("admin_auth_denied path=%s code=CSRF_INVALID", request.path)
             return _admin_error("CSRF token missing or invalid", "CSRF_INVALID")
         g.user_id = session["user_id"]
         g.user = session["user"]
@@ -1767,10 +1768,12 @@ def require_admin():
             pass
 
     if not os.getenv(ADMIN_TOKEN_ENV, "").strip():
+        app.logger.warning("admin_auth_denied path=%s code=ADMIN_TOKEN_MISSING", request.path)
         return _admin_error(
             "Admin session or JWT required. No legacy admin token is configured.",
             "ADMIN_TOKEN_MISSING",
         )
+    app.logger.warning("admin_auth_denied path=%s code=ADMIN_AUTH_REQUIRED", request.path)
     return _admin_error("Unauthorized. Provide a valid admin session or JWT.", "ADMIN_AUTH_REQUIRED")
 
 
@@ -12453,18 +12456,31 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
       providerSelect.disabled = true;
       if (providerSaveStatus) providerSaveStatus.textContent = 'Saving…';
       try {
-        const res = await fetch('/api/settings/provider', {
+        const res = await fetchWithTimeout('/api/settings/provider', {
           method: 'POST',
           headers: adminHeaders(),
           body: JSON.stringify({ provider }),
+          credentials: 'same-origin',
           // Keep the save alive if the user immediately navigates to New Order.
           keepalive: true
-        });
-        const data = await res.json();
+        }, 15000);
+        const data = await res.json().catch(function () { return {}; });
         if (!res.ok) {
           providerSaveFailed = true;
           providerSelect.value = previous;
-          showToast(data.error || 'Failed to switch provider.', 'error');
+          const code = String(data.code || '');
+          if (res.status === 401) {
+            try { sessionStorage.removeItem('notesaiAccessToken'); } catch (_) {}
+          }
+          if (code === 'ADMIN_AUTH_REQUIRED' || code === 'ADMIN_REQUIRED' || code === 'ADMIN_TOKEN_MISSING' || res.status === 401) {
+            showToast('Admin sign-in required. Please sign in again to change the AI provider.', 'error');
+            if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
+          } else if (code === 'CSRF_INVALID') {
+            showToast('Security token expired. Please sign in again.', 'error');
+            if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
+          } else {
+            showToast(data.error || 'Failed to switch provider.', 'error');
+          }
         } else {
           savedProvider = provider;
           showToast('AI provider switched to ' + provider + '.', 'success');
