@@ -438,7 +438,7 @@ def require_admin(f):
         session = resolve_admin_session()
         if session:
             if not csrf_token_valid(session):
-                return jsonify({"ok": False, "error": "CSRF token missing or invalid", "code": "CSRF_INVALID"}), 403
+                return jsonify({"ok": False, "error": "Session expired. Please sign in again.", "code": "CSRF_INVALID"}), 403
             g.user_id = session["user_id"]
             g.user = session["user"]
             g.user_role = "admin"
@@ -493,7 +493,7 @@ def require_user_or_admin(f):
         session = resolve_admin_session()
         if session:
             if not csrf_token_valid(session):
-                return jsonify({"ok": False, "error": "CSRF token missing or invalid", "code": "CSRF_INVALID"}), 403
+                return jsonify({"ok": False, "error": "Session expired. Please sign in again.", "code": "CSRF_INVALID"}), 403
             g.user_id = session["user_id"]
             g.user = session["user"]
             g.user_role = "admin"

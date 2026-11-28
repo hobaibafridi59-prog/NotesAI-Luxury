@@ -1731,7 +1731,7 @@ def require_admin():
     if session:
         if not csrf_token_valid(session):
             app.logger.warning("admin_auth_denied path=%s code=CSRF_INVALID", request.path)
-            return _admin_error("CSRF token missing or invalid", "CSRF_INVALID")
+            return _admin_error("Session expired. Please sign in again.", "CSRF_INVALID")
         g.user_id = session["user_id"]
         g.user = session["user"]
         g.user_role = "admin"
@@ -12479,7 +12479,7 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
             showToast('Admin sign-in required. Please sign in again to change the AI provider.', 'error');
             if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
           } else if (code === 'CSRF_INVALID') {
-            showToast('Security token expired. Please sign in again.', 'error');
+            showToast('Session expired. Please sign in again.', 'error');
             if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
           } else {
             showToast(data.error || 'Failed to switch provider.', 'error');
@@ -12530,8 +12530,8 @@ a.help-contact-row:hover { transform: translateY(-2px); border-color: rgba(139,9
           showToast('Admin sign-in required. Please sign in again.', 'error');
           if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
         } else if (code === 'CSRF_INVALID') {
-          if (providerTestStatus) providerTestStatus.textContent = 'Security token expired.';
-          showToast('Security token expired. Please sign in again.', 'error');
+          if (providerTestStatus) providerTestStatus.textContent = 'Session expired.';
+          showToast('Session expired. Please sign in again.', 'error');
           if (typeof window.notesaiOpenAuth === 'function') window.notesaiOpenAuth();
         } else {
           if (providerTestStatus) providerTestStatus.textContent = data.error || 'Connection failed.';
